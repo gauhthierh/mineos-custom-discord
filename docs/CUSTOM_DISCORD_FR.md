@@ -142,10 +142,22 @@ Vérifier `sha256sum -c mineos-custom-source.tar.gz.sha256` dans le dossier de t
 puis extraire le paquet dans le dossier de l'installation existante, sans déplacer
 `data/` ou `minecraft/`. Le paquet ne contient aucun fichier `.env`.
 
-Depuis le dossier de l'installation mis à jour :
+Pour télécharger, vérifier et appliquer cette révision depuis le dossier de ton
+installation actuelle, après la sauvegarde décrite ci-dessus :
 
 ```bash
-sudo bash scripts/migrate-layout.sh
+(
+  set -euo pipefail
+  install_dir="$PWD"
+  [[ -f .env || -f .env.custom ]] || { echo 'Place-toi dans le dossier de MineOS.' >&2; exit 1; }
+  download_dir=$(mktemp -d)
+  release_url=https://github.com/gauhthierh/mineos-custom-discord/releases/download/custom-discord-2026.11.05-preview.3
+  curl -fsSL "$release_url/mineos-custom-source.tar.gz" -o "$download_dir/mineos-custom-source.tar.gz"
+  curl -fsSL "$release_url/mineos-custom-source.tar.gz.sha256" -o "$download_dir/mineos-custom-source.tar.gz.sha256"
+  (cd "$download_dir" && sha256sum -c mineos-custom-source.tar.gz.sha256)
+  tar --no-same-owner -xzf "$download_dir/mineos-custom-source.tar.gz" -C "$install_dir"
+  sudo bash scripts/migrate-layout.sh
+)
 ```
 
 Le script arrête l'ancien projet Compose, conserve son fichier sous

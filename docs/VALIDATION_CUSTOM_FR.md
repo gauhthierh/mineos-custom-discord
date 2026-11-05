@@ -15,6 +15,13 @@ Date : 5 novembre 2026. Base d'origine : branche `vibing`, commit `12bbed1`.
 - Vérification de l'interface relancée : aucune erreur, 93 avertissements existants.
 - Le workflow de cette révision teste aussi le démarrage et la connexion réelle
   du compte administrateur, puis les routes Discord authentifiées, sur Linux.
+- Tous ces contrôles et la publication ont réussi :
+  https://github.com/gauhthierh/mineos-custom-discord/actions/runs/42024112099
+- Release : `custom-discord-2026.11.05-preview.3`, commit `32b1787`.
+- Paquet public téléchargé après publication et empreinte SHA-256 vérifiée :
+  `6cd9451ed8294c8473b05d625d84a462ef37d89cb5b79c9824c21171781db3c9`.
+- Cette correction est publiée ; elle n'a pas été appliquée à distance au Debian
+  du propriétaire. La migration avec ses données reste à effectuer sur sa machine.
 
 ## Résultats de la première préversion
 

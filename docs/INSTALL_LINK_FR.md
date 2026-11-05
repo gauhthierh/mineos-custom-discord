@@ -96,6 +96,9 @@ personnel dans l'installateur ni d'en communiquer dans le chat.
 La première préversion a été validée sur Linux. La nouvelle publication refait
 ces contrôles avec les fichiers standards et teste aussi la connexion du compte
 administrateur et l’accès aux fonctions Discord.
+Cette validation et la publication de preview.3 ont réussi :
+https://github.com/gauhthierh/mineos-custom-discord/actions/runs/42024112099
+Les trois fichiers publics ont été téléchargés et l'empreinte vérifiée.
 L'installation complète sur le Debian 13 du propriétaire reste à réaliser.
 
 Sources :
