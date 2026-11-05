@@ -29,6 +29,7 @@ namespace MineOS.Tests.Unit;
 /// launch, so they do not need `screen` on PATH: both calls fail after the check, and
 /// what matters is that the second never enters while the first is still inside.
 /// </summary>
+[Collection("Server lifecycle concurrency")]
 public class ServerStartConcurrencyTests
 {
     [Fact]
@@ -220,3 +221,10 @@ public class ServerStartConcurrencyTests
             Mock.Of<IDiscordWebhookService>());
     }
 }
+
+// These tests exercise a real five-second busy timeout. Unrelated parallel tests
+// can starve the runner's worker pool long enough that the 100ms observation in
+// the ordering tests expires that timeout instead. Keep their two concurrent
+// lifecycle calls, but isolate the collection from unrelated workload.
+[CollectionDefinition("Server lifecycle concurrency", DisableParallelization = true)]
+public sealed class ServerLifecycleConcurrencyCollection;
