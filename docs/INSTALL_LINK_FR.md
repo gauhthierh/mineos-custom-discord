@@ -73,9 +73,12 @@ ni la configuration du domaine du propriétaire.
    L'installateur publié contient automatiquement le nom du bon dépôt.
 6. Les notes de release fournissent la commande exacte à copier.
 
-Le workflow est exclusivement manuel. Aucun tag `v*` n'est créé : ces tags sont
-réservés au circuit de publication du projet d'origine. Une release existante
-n'est pas écrasée ; une nouvelle version reçoit un nouveau tag custom.
+La publication se lance manuellement depuis GitHub Actions ou en poussant
+explicitement un nouveau tag `custom-*`. Un tag contenant `-preview` publie une
+préversion. Les simples modifications de la branche ne publient aucune release.
+Aucun tag `v*` n'est créé : ces tags sont réservés au circuit de publication du
+projet d'origine. Une release existante n'est pas écrasée ; une nouvelle version
+reçoit un nouveau tag custom.
 
 La publication utilise le jeton intégré de GitHub Actions, avec écriture limitée
 au travail de publication. Le propriétaire n'a pas besoin de mettre un jeton
