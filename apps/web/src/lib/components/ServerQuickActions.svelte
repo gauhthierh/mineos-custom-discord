@@ -1,0 +1,338 @@
+<script lang="ts">
+	import { createEventDispatcher } from 'svelte';
+	import { browser } from '$app/environment';
+	import { env } from '$env/dynamic/public';
+	import { invalidateAll } from '$app/navigation';
+	import * as api from '$lib/api/client';
+	import { modal } from '$lib/stores/modal';
+	import CopyButton from '$lib/components/CopyButton.svelte';
+	import type { ServerDetail } from '$lib/api/types';
+
+	let { server }: { server: ServerDetail | null } = $props();
+	const dispatch = createEventDispatcher<{ refresh: void }>();
+
+	let actionLoading = $state(false);
+	let serverPort = $state<number>(25565);
+	let status = $derived((server?.status ?? '').toLowerCase());
+	let isRunning = $derived(status === 'up' || status === 'running');
+
+	// Load server port — proxies bind via velocity.toml, everyone else via server.properties.
+	// Keyed on server name so switching servers (this component lives in the persisted
+	// layout) reloads the port instead of showing the previous server's. The cancelled
+	// flag drops a late response from a server we've already navigated away from.
+	$effect(() => {
+		const name = server?.name;
+		const serverType = server?.serverType;
+		if (!name) return;
+		let cancelled = false;
+		(async () => {
+			try {
+				if (serverType === 'proxy') {
+					const result = await api.getVelocityConfig(fetch, name);
+					const bind = result.data?.bind;
+					if (bind) {
+						// Velocity bind format: "<host>:<port>" or "[::]:port" for IPv6.
+						// Split on the LAST ":" so IPv6 hosts don't break parsing.
+						const lastColon = bind.lastIndexOf(':');
+						if (lastColon > 0 && lastColon < bind.length - 1) {
+							const parsed = parseInt(bind.slice(lastColon + 1), 10);
+							if (!isNaN(parsed) && !cancelled) {
+								serverPort = parsed;
+							}
+						}
+					}
+				} else {
+					const result = await api.getServerProperties(fetch, name);
+					if (result.data) {
+						const port = result.data['server-port'];
+						if (port) {
+							const parsed = parseInt(port, 10);
+							if (!isNaN(parsed) && !cancelled) {
+								serverPort = parsed;
+							}
+						}
+					}
+				}
+			} catch (err) {
+				// Use default port if loading fails
+				console.error('Failed to load server port:', err);
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	// Calculate the server address to display
+	const serverAddress = $derived.by(() => {
+		if (!server) return '';
+		const envHost = env.PUBLIC_MINECRAFT_HOST as string | undefined;
+		const host = (envHost && envHost.trim()) || (browser ? window.location.hostname : 'localhost');
+		return host.includes(':') ? host : `${host}:${serverPort}`;
+	});
+
+	async function handleAction(action: 'start' | 'stop' | 'restart' | 'kill') {
+		if (!server) return;
+
+		// If starting and EULA not accepted, prompt instead of erroring
+		if (action === 'start' && !server.eulaAccepted && server.serverType !== 'bedrock' && server.serverType !== 'proxy') {
+			const accepted = await modal.confirm(
+				'This server requires you to accept the Minecraft EULA before starting.\n\n' +
+				'By accepting, you agree to the Minecraft End User License Agreement:\n' +
+				'https://aka.ms/MinecraftEULA',
+				'Accept EULA'
+			);
+			if (!accepted) return;
+
+			actionLoading = true;
+			try {
+				const eulaResult = await api.acceptEula(fetch, server.name);
+				if (eulaResult.error) {
+					await modal.error(`Failed to accept EULA: ${eulaResult.error}`);
+					return;
+				}
+				server.eulaAccepted = true;
+			} finally {
+				actionLoading = false;
+			}
+		}
+
+		actionLoading = true;
+		try {
+			let result;
+			switch (action) {
+				case 'start':
+					result = await api.startServer(fetch, server.name);
+					break;
+				case 'stop':
+					result = await api.stopServer(fetch, server.name);
+					break;
+				case 'restart':
+					result = await api.restartServer(fetch, server.name);
+					break;
+				case 'kill':
+					result = await api.killServer(fetch, server.name);
+					break;
+			}
+
+			if (result.error) {
+				await modal.error(`Failed to ${action} server: ${result.error}`);
+			} else {
+				dispatch('refresh');
+				setTimeout(() => dispatch('refresh'), 2000);
+				setTimeout(() => invalidateAll(), 2000);
+			}
+		} finally {
+			actionLoading = false;
+		}
+	}
+
+	async function handleAcceptEula() {
+		if (!server) return;
+
+		actionLoading = true;
+		try {
+			const result = await api.acceptEula(fetch, server.name);
+			if (result.error) {
+				await modal.error(`Failed to accept EULA: ${result.error}`);
+			} else {
+				await modal.success('EULA accepted successfully! You can now start the server.');
+				dispatch('refresh');
+				await invalidateAll();
+			}
+		} finally {
+			actionLoading = false;
+		}
+	}
+
+</script>
+
+{#if server}
+	<div class="server-controls">
+		<!-- Server Address Section -->
+		<div class="address-section">
+			<div class="address-display">
+				<code class="server-address">
+					{serverAddress}
+				</code>
+				<CopyButton value={serverAddress} title="Copy server address" variant="solid" size="md" />
+			</div>
+			{#if server.needsRestart}
+				<span class="pill">Restart required</span>
+			{/if}
+		</div>
+
+		<!-- Action Buttons -->
+		<div class="action-buttons">
+			{#if isRunning}
+				<button class="btn btn-warning" onclick={() => handleAction('stop')} disabled={actionLoading}>
+					Stop
+				</button>
+				<button class="btn btn-primary" onclick={() => handleAction('restart')} disabled={actionLoading}>
+					Restart
+				</button>
+				<button class="btn btn-danger" onclick={() => handleAction('kill')} disabled={actionLoading}>
+					Kill
+				</button>
+			{:else}
+				<button class="btn btn-success" onclick={() => handleAction('start')} disabled={actionLoading}>
+					Start
+				</button>
+				{#if server.serverType !== 'bedrock' && server.serverType !== 'proxy'}
+					<button
+						class="btn btn-secondary"
+						onclick={handleAcceptEula}
+						disabled={actionLoading || server.eulaAccepted}
+					>
+						{server.eulaAccepted ? 'EULA accepted' : 'Accept EULA'}
+					</button>
+				{/if}
+			{/if}
+		</div>
+	</div>
+{/if}
+
+<style>
+	.server-controls {
+		background: var(--mc-panel-dark, #141827);
+		border-radius: 14px;
+		padding: 16px;
+		border: 1px solid var(--border-color, #2a2f47);
+		display: flex;
+		flex-direction: column;
+		gap: 14px;
+		min-width: 300px;
+	}
+
+	.address-section {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.address-display {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+
+	.server-address {
+		flex: 1;
+		background: var(--mc-panel-darkest, #0d1117);
+		border: 1px solid var(--border-color, #2a2f47);
+		padding: 10px 14px;
+		border-radius: 8px;
+		font-family: 'Courier New', 'Consolas', monospace;
+		font-size: 14px;
+		color: var(--mc-grass, #6ab04c);
+		font-weight: 600;
+		letter-spacing: 0.5px;
+		display: block;
+	}
+
+	.pill {
+		background: rgba(255, 200, 87, 0.15);
+		border: 1px solid rgba(255, 200, 87, 0.3);
+		color: #f4c08e;
+		padding: 6px 12px;
+		border-radius: 999px;
+		font-size: 11px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		align-self: flex-start;
+	}
+
+	.action-buttons {
+		display: flex;
+		gap: 10px;
+		flex-wrap: wrap;
+	}
+
+
+	.btn {
+		background: #2b2f45;
+		color: #d4d9f1;
+		border: none;
+		border-radius: 8px;
+		padding: 10px 16px;
+		font-family: inherit;
+		font-size: 13px;
+		font-weight: 600;
+		cursor: pointer;
+		transition: all 0.2s;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.btn:hover:not(:disabled) {
+		transform: translateY(-1px);
+		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+	}
+
+	.btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.btn-primary {
+		background: var(--mc-grass);
+		color: white;
+	}
+
+	.btn-primary:hover:not(:disabled) {
+		background: var(--mc-grass-dark);
+	}
+
+	.btn-success {
+		background: rgba(106, 176, 76, 0.18);
+		color: #b7f5a2;
+		border: 1px solid rgba(106, 176, 76, 0.35);
+	}
+
+	.btn-success:hover:not(:disabled) {
+		background: rgba(106, 176, 76, 0.28);
+	}
+
+	.btn-warning {
+		background: rgba(139, 90, 43, 0.2);
+		color: #f4c08e;
+		border: 1px solid rgba(139, 90, 43, 0.4);
+	}
+
+	.btn-warning:hover:not(:disabled) {
+		background: rgba(139, 90, 43, 0.3);
+	}
+
+	.btn-danger {
+		background: rgba(210, 94, 72, 0.2);
+		color: #ffb6a6;
+		border: 1px solid rgba(210, 94, 72, 0.4);
+	}
+
+	.btn-danger:hover:not(:disabled) {
+		background: rgba(210, 94, 72, 0.3);
+	}
+
+	.btn-secondary {
+		background: #2b2f45;
+		color: #d4d9f1;
+		border: 1px solid #3a3f5a;
+	}
+
+	.btn-secondary:hover:not(:disabled) {
+		background: #3a3f5a;
+	}
+
+	@media (max-width: 720px) {
+		.server-controls {
+			width: 100%;
+			min-width: unset;
+		}
+
+		.server-address {
+			font-size: 13px;
+		}
+	}
+</style>

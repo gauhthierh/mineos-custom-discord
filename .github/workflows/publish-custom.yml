@@ -1,0 +1,87 @@
+name: Publish custom Discord version
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New custom-* release tag (never v*)'
+        required: true
+        type: string
+      preview:
+        description: 'Publish as a preview release'
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Validate release tag and installer
+        env:
+          CUSTOM_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$CUSTOM_TAG" =~ ^custom-[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ ]]
+          bash test/install-custom-test.sh
+          bash -n scripts/prepare-custom.sh
+          docker compose --env-file .env.custom.example -f compose.custom.yml config --quiet
+      - name: Backend tests
+        run: dotnet test apps/MineOS.Tests/MineOS.Tests.csproj -p:NuGetAuditMode=all -warnaserror:NU1901,NU1902,NU1903,NU1904
+      - name: Frontend checks and build
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm run check
+          npm run test:unit
+          npm run build
+      - name: Build Linux containers
+        run: docker compose --env-file .env.custom.example -f compose.custom.yml build
+      - name: Check Linux startup
+        run: docker compose --env-file .env.custom.example -f compose.custom.yml up -d --no-build --wait --wait-timeout 180
+      - name: Stop validation containers
+        if: always()
+        run: docker compose --env-file .env.custom.example -f compose.custom.yml down
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare release files
+        env:
+          CUSTOM_TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p dist
+          git archive --format=tar.gz --output=dist/mineos-custom-source.tar.gz HEAD
+          sed "s|^repository=.*|repository='${GITHUB_REPOSITORY}'|" scripts/install-custom.sh > dist/install-custom.sh
+          (cd dist && sha256sum mineos-custom-source.tar.gz > mineos-custom-source.tar.gz.sha256)
+          printf 'MineOS custom Discord — %s\n\n' "$CUSTOM_TAG" > dist/release-notes.md
+          printf 'Source commit: %s\n\n' "$GITHUB_SHA" >> dist/release-notes.md
+          printf 'Install this exact version:\n\n```bash\ncurl -fsSL https://github.com/%s/releases/download/%s/install-custom.sh | bash -s -- --version %s\n```\n' \
+            "$GITHUB_REPOSITORY" "$CUSTOM_TAG" "$CUSTOM_TAG" >> dist/release-notes.md
+      - name: Publish validated release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CUSTOM_TAG: ${{ inputs.tag }}
+          IS_PREVIEW: ${{ inputs.preview }}
+        run: |
+          flags=(--latest)
+          if [[ "$IS_PREVIEW" == true ]]; then flags=(--prerelease --latest=false); fi
+          gh release create "$CUSTOM_TAG" \
+            dist/install-custom.sh dist/mineos-custom-source.tar.gz dist/mineos-custom-source.tar.gz.sha256 \
+            --target "$GITHUB_SHA" --title "MineOS custom Discord — $CUSTOM_TAG" \
+            --notes-file dist/release-notes.md "${flags[@]}"

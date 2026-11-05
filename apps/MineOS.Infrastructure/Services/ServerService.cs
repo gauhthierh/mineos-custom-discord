@@ -1,0 +1,2915 @@
+using System.Collections.Concurrent;
+using System.Text;
+using System.Diagnostics;
+using System.IO.Compression;
+using System.Security;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using MineOS.Application.Dtos;
+using MineOS.Application.Interfaces;
+using MineOS.Application.Options;
+using MineOS.Domain.Entities;
+using MineOS.Infrastructure.Utilities;
+using ServerStatusStrings = MineOS.Infrastructure.Constants.ServerStatus;
+using Tomlyn;
+using Tomlyn.Model;
+using YamlDotNet.RepresentationModel;
+using YamlDotNet.Serialization;
+
+namespace MineOS.Infrastructure.Services;
+
+public class ServerService : IServerService
+{
+    private const string RestartFlagFile = ".mineos-restart-required";
+    private const string StopRequestedFlagFile = ".mineos-stop-requested";
+    private readonly IProcessManager _processManager;
+    private readonly HostOptions _options;
+    private readonly ILogger<ServerService> _logger;
+    private readonly ITelemetryService _telemetryService;
+    private readonly ITelemetryReportTrigger _telemetryReportTrigger;
+    private readonly IDiscordWebhookService _discordWebhook;
+
+    public ServerService(
+        IProcessManager processManager,
+        IOptions<HostOptions> options,
+        ILogger<ServerService> logger,
+        ITelemetryService telemetryService,
+        ITelemetryReportTrigger telemetryReportTrigger,
+        IDiscordWebhookService discordWebhook)
+    {
+        _processManager = processManager;
+        _options = options.Value;
+        _logger = logger;
+        _telemetryService = telemetryService;
+        _telemetryReportTrigger = telemetryReportTrigger;
+        _discordWebhook = discordWebhook;
+    }
+
+    private string GetServerPath(string name) =>
+        Path.Combine(_options.BaseDirectory, _options.ServersPathSegment, name);
+
+    private string GetBackupPath(string name) =>
+        Path.Combine(_options.BaseDirectory, "backup", name);
+
+    private string GetArchivePath(string name) =>
+        Path.Combine(_options.BaseDirectory, "archive", name);
+
+    private const string ServerTypeFile = ".mineos-server-type";
+
+    /// <summary>
+    /// Returns the Java binary path appropriate for the given Minecraft version.
+    /// MC 1.26+ needs Java 25, 1.21-1.25 needs 21, 1.17-1.20 needs 17, older needs 8.
+    /// Each tier accepts newer runtimes when its exact match is not installed, so a jar
+    /// that raises its floor keeps starting instead of failing to load.
+    /// </summary>
+    public static string ResolveJavaBinary(string? minecraftVersion)
+    {
+        if (string.IsNullOrWhiteSpace(minecraftVersion))
+            return "java"; // Use default JAVA_HOME
+
+        // Parse major.minor from version like "1.21.11", "26.1", etc.
+        var parts = minecraftVersion.Split('.');
+        if (!int.TryParse(parts[0], out var major))
+            return "java";
+
+        // New versioning: 26.x+ (Minecraft dropped the "1." prefix)
+        if (major >= 26)
+            return FindJavaBinary(JavaFallbackOrder(25));
+
+        // Old versioning: 1.x.y
+        if (major == 1 && parts.Length >= 2 && int.TryParse(parts[1], out var minor))
+        {
+            if (minor >= 21) return FindJavaBinary(JavaFallbackOrder(21));
+            if (minor >= 17) return FindJavaBinary(JavaFallbackOrder(17));
+
+            // No upward fallback below 17: legacy Minecraft genuinely breaks on modern
+            // JVMs (removed internals, stricter reflection), so a newer runtime is not a
+            // safe substitute the way it is for 17+.
+            return FindJavaBinary(8);
+        }
+
+        return "java";
+    }
+
+    private static string FindJavaBinary(params int[] preferredVersions)
+    {
+        foreach (var ver in preferredVersions)
+        {
+            // Check common Adoptium/Temurin install paths
+            var paths = new[]
+            {
+                $"/usr/lib/jvm/temurin-{ver}-jdk-amd64/bin/java",
+                $"/usr/lib/jvm/temurin-{ver}-jdk-arm64/bin/java",
+                $"/usr/lib/jvm/temurin-{ver}-jdk/bin/java",
+                $"/usr/lib/jvm/java-{ver}-openjdk-amd64/bin/java",
+                $"/usr/lib/jvm/java-{ver}-openjdk/bin/java",
+            };
+
+            foreach (var path in paths)
+            {
+                if (File.Exists(path))
+                    return path;
+            }
+        }
+
+        return "java"; // Fallback to PATH default
+    }
+
+    // Java majors we know how to look for on disk, ascending.
+    private static readonly int[] KnownJavaMajors = { 8, 11, 17, 21, 25 };
+
+    /// <summary>
+    /// Candidate Java majors for a jar needing <paramref name="required"/>: the exact
+    /// match first, then progressively newer runtimes, since a jar always loads on a
+    /// newer JVM than it was compiled for.
+    /// </summary>
+    private static int[] JavaFallbackOrder(int required) =>
+        new[] { required }
+            .Concat(KnownJavaMajors.Where(v => v > required))
+            .Distinct()
+            .ToArray();
+
+    /// <summary>
+    /// Reads the class file version of a jar's Main-Class and converts it to the minimum
+    /// Java major version needed to load it (class file 61 = Java 17, 65 = 21, 69 = 25).
+    /// Returns null when the jar cannot be inspected, so callers can fall back to a
+    /// version heuristic.
+    /// </summary>
+    public static int? DetectRequiredJavaFromJar(string jarPath)
+    {
+        try
+        {
+            if (!File.Exists(jarPath))
+                return null;
+
+            using var archive = ZipFile.OpenRead(jarPath);
+
+            var manifestEntry = archive.GetEntry("META-INF/MANIFEST.MF");
+            if (manifestEntry is null)
+                return null;
+
+            string manifest;
+            using (var reader = new StreamReader(manifestEntry.Open()))
+                manifest = reader.ReadToEnd();
+
+            // Manifest values wrap at 72 bytes and continue on a line starting with a
+            // single space; unfold before matching or Main-Class comes back truncated.
+            manifest = manifest.Replace("\r\n ", "").Replace("\n ", "").Replace("\r ", "");
+
+            var match = System.Text.RegularExpressions.Regex.Match(manifest, @"Main-Class:\s*(\S+)");
+            if (!match.Success)
+                return null;
+
+            var classEntry = archive.GetEntry(match.Groups[1].Value.Replace('.', '/') + ".class");
+            if (classEntry is null)
+                return null;
+
+            using var stream = classEntry.Open();
+            var header = new byte[8];
+            var read = 0;
+            while (read < header.Length)
+            {
+                var n = stream.Read(header, read, header.Length - read);
+                if (n <= 0)
+                    return null;
+                read += n;
+            }
+
+            // u4 magic 0xCAFEBABE, u2 minor_version, u2 major_version
+            if (header[0] != 0xCA || header[1] != 0xFE || header[2] != 0xBA || header[3] != 0xBE)
+                return null;
+
+            var classFileVersion = (header[6] << 8) | header[7];
+            if (classFileVersion < 45)
+                return null;
+
+            return classFileVersion - 44;
+        }
+        catch
+        {
+            // Unreadable, truncated, or not a zip - let the caller fall back.
+            return null;
+        }
+    }
+
+    // Velocity has required at least Java 17 since 3.0.0, so never resolve below it.
+    private const int ProxyJavaFloor = 17;
+
+    /// <summary>
+    /// Resolves a Java binary from the jar's own bytecode target, tracking upstream
+    /// automatically when a jar bumps its requirement. Returns null when the jar cannot
+    /// be inspected.
+    /// </summary>
+    /// <remarks>
+    /// PROXIES ONLY. This reads the class file version of the jar's Main-Class, which is
+    /// only meaningful when Main-Class is the real entry point - true for Velocity and
+    /// BungeeCord. Paper and Fabric server jars are bootstrap launchers whose Main-Class
+    /// (io.papermc.paperclip.Main, net.fabricmc.installer.ServerLauncher) is deliberately
+    /// compiled to an ancient target so it can print a friendly error on old JVMs: Paper
+    /// 1.21.11 reports class file 50 (Java 6) and Fabric reports 52 (Java 8), nowhere near
+    /// what the server actually needs. Java servers keep using the MC-version heuristic.
+    /// </remarks>
+    private string? ResolveJavaBinaryFromJar(string serverPath, string? jarFile, string serverName)
+    {
+        // Forge @argfile syntax points at argument files, not a jar we can read.
+        if (string.IsNullOrWhiteSpace(jarFile) || jarFile.TrimStart().StartsWith("@"))
+            return null;
+
+        var detected = DetectRequiredJavaFromJar(Path.Combine(serverPath, jarFile));
+        if (detected is null)
+            return null;
+
+        // Guard against a future bootstrap-style Main-Class dragging the choice down.
+        var required = Math.Max(detected.Value, ProxyJavaFloor);
+
+        var javaBinary = FindJavaBinary(JavaFallbackOrder(required));
+        _logger.LogInformation(
+            "Resolved Java binary for proxy {Server} from {JarFile} bytecode (needs Java {Required}): {JavaBinary}",
+            serverName, jarFile, required, javaBinary);
+        return javaBinary;
+    }
+
+    private string GetPropertiesPath(string name) =>
+        Path.Combine(GetServerPath(name), "server.properties");
+
+    private string GetConfigPath(string name) =>
+        Path.Combine(GetServerPath(name), "server.config");
+
+    private string GetServerTypePath(string name) =>
+        Path.Combine(GetServerPath(name), ServerTypeFile);
+
+    private string DetectServerType(string name)
+    {
+        var typeFile = GetServerTypePath(name);
+        if (File.Exists(typeFile))
+        {
+            var content = File.ReadAllText(typeFile).Trim();
+            if (!string.IsNullOrWhiteSpace(content))
+                return content;
+        }
+        // Check for bedrock_server binary
+        var serverPath = GetServerPath(name);
+        if (File.Exists(Path.Combine(serverPath, "bedrock_server")))
+            return "bedrock";
+        return "java";
+    }
+
+    private string GetRestartFlagPath(string name) =>
+        Path.Combine(GetServerPath(name), RestartFlagFile);
+
+    private string GetStopRequestedFlagPath(string name) =>
+        Path.Combine(GetServerPath(name), StopRequestedFlagFile);
+
+    public async Task<ServerDetailDto> GetServerAsync(string name, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        var dirInfo = new DirectoryInfo(serverPath);
+        var processInfo = _processManager.GetServerProcess(name);
+
+        var serverType = DetectServerType(name);
+        var config = await GetServerConfigAsync(name, cancellationToken);
+
+        var status = processInfo?.JavaPid != null ? "running" : "stopped";
+        var eulaAccepted = serverType == "bedrock" || serverType == "proxy"
+            || await IsEulaAcceptedAsync(serverPath, cancellationToken);
+        var needsRestart = File.Exists(GetRestartFlagPath(name));
+
+        // Get owner info from directory
+        // On Linux, we'd use syscalls or a library to get uid/gid
+        // For now, placeholder values
+        var ownerUid = 1000; // TODO: Get actual owner
+        var ownerGid = 1000;
+        var ownerUsername = "user"; // TODO: Get actual username
+        var ownerGroupname = "user"; // TODO: Get actual group
+
+        return new ServerDetailDto(
+            name,
+            dirInfo.CreationTimeUtc,
+            ownerUid,
+            ownerGid,
+            ownerUsername,
+            ownerGroupname,
+            status,
+            processInfo?.JavaPid,
+            processInfo?.ScreenPid,
+            config,
+            serverType,
+            eulaAccepted,
+            needsRestart,
+            config.DisplayName
+        );
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex SafeServerNameRegex = new(
+        @"^[a-zA-Z0-9][a-zA-Z0-9 _\-\.]{0,63}$",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>
+    /// Directory name for a newly created server: a slug of the label the user typed,
+    /// plus a short random suffix.
+    /// </summary>
+    /// <remarks>
+    /// The typed name used to become the directory name verbatim, permanently — so a
+    /// server called "Server Loco" lived at "servers/Server Loco" forever, and every
+    /// consumer of that path had to cope with whatever characters a label may contain.
+    /// Spaces alone broke screen-session detection. Since a server now carries a mutable
+    /// display name (issue #180), the on-disk identity no longer has to be the label.
+    ///
+    /// A readable slug rather than a bare GUID: these paths get typed into shells, read
+    /// in logs and grepped for, and "server-loco-7f3a" survives that where a UUID does
+    /// not. The suffix is unconditional, not collision-triggered — it keeps the shape
+    /// predictable and avoids a check-then-create race between two simultaneous creates.
+    ///
+    /// Existing servers keep their directories. This applies to new ones only.
+    /// </remarks>
+    public static string GenerateServerDirectoryName(string displayName)
+    {
+        var slug = Slugify(displayName);
+        var suffix = Guid.NewGuid().ToString("N")[..4];
+        return slug.Length == 0 ? $"server-{suffix}" : $"{slug}-{suffix}";
+    }
+
+    /// <summary>
+    /// Lowercases and reduces a label to [a-z0-9-]: runs of anything else collapse to a
+    /// single hyphen. Returns an empty string when the label has nothing usable in it
+    /// (e.g. all non-Latin characters), which the caller substitutes for.
+    /// </summary>
+    public static string Slugify(string value)
+    {
+        var builder = new StringBuilder();
+        foreach (var ch in (value ?? string.Empty).Trim().ToLowerInvariant())
+        {
+            if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))
+            {
+                builder.Append(ch);
+            }
+            else if (builder.Length > 0 && builder[^1] != '-')
+            {
+                builder.Append('-');
+            }
+        }
+
+        var slug = builder.ToString().Trim('-');
+        // Leave room for the suffix inside a sane path length.
+        return slug.Length > 40 ? slug[..40].TrimEnd('-') : slug;
+    }
+
+    public async Task<ServerDetailDto> CreateServerAsync(
+        CreateServerRequest request,
+        string username,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Name))
+            throw new ArgumentException("Server name is required");
+
+        if (!SafeServerNameRegex.IsMatch(request.Name))
+            throw new ArgumentException("Server name contains invalid characters. Use letters, numbers, spaces, hyphens, underscores, or dots.");
+
+        if (request.Name.Contains(".."))
+            throw new ArgumentException("Server name cannot contain '..'");
+
+        // Validate the proxy kind before anything is created on disk. Otherwise an
+        // unrecognized value throws part-way through the proxy branch below and
+        // leaves a half-built server behind. NormalizeProxyKind is pure, so the
+        // call in that branch can stay as-is.
+        if (string.Equals(request.ServerType, "proxy", StringComparison.OrdinalIgnoreCase))
+            NormalizeProxyKind(request.ProxyKind);
+
+        // What the user typed is the label; the directory is a slug derived from it.
+        var directoryName = GenerateServerDirectoryName(request.Name);
+        var serverPath = GetServerPath(directoryName);
+        var backupPath = GetBackupPath(directoryName);
+        var archivePath = GetArchivePath(directoryName);
+
+        if (Directory.Exists(serverPath))
+        {
+            throw new InvalidOperationException($"Server '{request.Name}' already exists");
+        }
+
+        // Create directories
+        Directory.CreateDirectory(serverPath);
+        Directory.CreateDirectory(backupPath);
+        Directory.CreateDirectory(archivePath);
+
+        // Write server type marker
+        var serverType = string.IsNullOrWhiteSpace(request.ServerType) ? "java" : request.ServerType.ToLowerInvariant();
+        await File.WriteAllTextAsync(
+            Path.Combine(serverPath, ServerTypeFile), serverType, cancellationToken);
+
+        // Create default files
+        var propertiesPath = GetPropertiesPath(directoryName);
+        var configPath = GetConfigPath(directoryName);
+
+        var usedPorts = await GetUsedPortsAsync(excludeName: null, cancellationToken);
+
+        if (serverType == "bedrock")
+        {
+            var defaultPort = GetNextAvailablePort(usedPorts, 19132);
+
+            // Bedrock server.properties
+            var bedrockProperties = new Dictionary<string, string>
+            {
+                ["server-name"] = request.Name,
+                ["gamemode"] = "survival",
+                ["force-gamemode"] = "false",
+                ["difficulty"] = "easy",
+                ["allow-cheats"] = "false",
+                ["max-players"] = "10",
+                ["online-mode"] = "true",
+                ["allow-list"] = "true",
+                ["server-port"] = defaultPort.ToString(),
+                ["server-portv6"] = (defaultPort + 1).ToString(),
+                ["view-distance"] = "32",
+                ["tick-distance"] = "4",
+                ["player-idle-timeout"] = "30",
+                ["max-threads"] = "8",
+                ["level-name"] = "Bedrock level",
+                ["level-seed"] = "",
+                ["level-type"] = "DEFAULT",
+                ["default-player-permission-level"] = "member",
+                ["texturepack-required"] = "false",
+                ["content-log-file-enabled"] = "false",
+                ["compression-threshold"] = "1",
+                ["compression-algorithm"] = "zlib",
+                ["server-authoritative-movement"] = "server-auth",
+                ["player-movement-score-threshold"] = "20",
+                ["player-movement-action-direction-threshold"] = "0.85",
+                ["player-movement-distance-threshold"] = "0.3",
+                ["player-movement-duration-threshold-in-ms"] = "500",
+                ["correct-player-movement"] = "false",
+                ["server-authoritative-block-breaking"] = "false",
+                ["chat-restriction"] = "None",
+                ["disable-player-interaction"] = "false",
+                ["client-side-chunk-generation-enabled"] = "true",
+                ["block-network-ids-are-hashes"] = "true",
+                ["disable-persona"] = "false",
+                ["disable-custom-skins"] = "false",
+                ["emit-server-telemetry"] = "false"
+            };
+
+            await File.WriteAllTextAsync(propertiesPath, IniParser.WriteSimple(bedrockProperties), cancellationToken);
+
+            // Bedrock server.config (minimal - no Java section needed for operation, but kept for compatibility)
+            var bedrockConfig = new Dictionary<string, Dictionary<string, string>>
+            {
+                ["display"] = new()
+                {
+                    ["name"] = request.Name
+                },
+                ["bedrock"] = new()
+                {
+                    ["binary"] = "./bedrock_server"
+                },
+                ["minecraft"] = new()
+                {
+                    ["profile"] = "",
+                    ["unconventional"] = "false",
+                    ["lan_broadcast"] = "false"
+                },
+                ["onreboot"] = new()
+                {
+                    ["start"] = "false"
+                },
+                ["monitoring"] = new()
+                {
+                    ["tps_enabled"] = "false",
+                    ["tps_command"] = ""
+                }
+            };
+
+            await File.WriteAllTextAsync(configPath, IniParser.WriteWithSections(bedrockConfig), cancellationToken);
+        }
+        else if (serverType == "proxy")
+        {
+            // Proxies (Velocity / BungeeCord): no server.properties,
+            // no EULA, no world. The proxy creates its own config file on first
+            // launch (velocity.toml or config.yml). Default bind port 25577.
+            var defaultPort = GetNextAvailablePort(usedPorts, 25577);
+
+            var proxyConfig = new Dictionary<string, Dictionary<string, string>>
+            {
+                ["display"] = new()
+                {
+                    ["name"] = request.Name
+                },
+                ["java"] = new()
+                {
+                    ["java_binary"] = "",
+                    ["java_xmx"] = "1024",
+                    ["java_xms"] = "512"
+                },
+                ["minecraft"] = new()
+                {
+                    ["profile"] = "",
+                    // Proxies reject "nogui"; treat as unconventional so the
+                    // launcher does not append it.
+                    ["unconventional"] = "true",
+                    ["lan_broadcast"] = "false"
+                },
+                ["onreboot"] = new()
+                {
+                    ["start"] = "false"
+                },
+                ["monitoring"] = new()
+                {
+                    ["tps_enabled"] = "false",
+                    ["tps_command"] = ""
+                }
+            };
+
+            await File.WriteAllTextAsync(configPath, IniParser.WriteWithSections(proxyConfig), cancellationToken);
+
+            var proxyKind = NormalizeProxyKind(request.ProxyKind);
+
+            if (proxyKind == "velocity")
+            {
+                // A new proxy starts with no backends. Registering every sibling server
+                // automatically looked helpful and was not: attaching a backend is a
+                // security operation - attachServerToProxy installs the forwarding mod
+                // and secures identity - and writing names straight into the config does
+                // none of that, so the proxy came up fronting servers that cannot verify
+                // who a forwarded player claims to be. MineOS then reported those very
+                // backends as Unverifiable in its own exposure table.
+                //
+                // It also guessed which one players land on (the alphabetically first),
+                // and on a host running several Minecraft versions most of the routes it
+                // wrote could never work for a given client. Attach is a deliberate,
+                // one-at-a-time action from the proxies page; leave it to that.
+                var initialConfig = VelocityConfigDefaults(exists: true) with
+                {
+                    Bind = $"0.0.0.0:{defaultPort}",
+                    Servers = new Dictionary<string, string>(),
+                    Try = new List<string>()
+                };
+                var tomlPath = Path.Combine(serverPath, "velocity.toml");
+                await WriteVelocityTomlAsync(tomlPath, initialConfig, cancellationToken);
+            }
+            else
+            {
+                // BungeeCord — bootstrap config.yml in its YAML schema.
+                // BungeeCord refuses to start with an empty servers: map
+                // ("IllegalArgumentException: No servers defined"), so it gets the same
+                // placeholder BungeeCord itself ships in its default config.yml. This is
+                // a stub to satisfy the parser, not a real backend: attaching one is a
+                // deliberate action from the proxies page. See the Velocity branch above.
+                var bungeeBackends = new Dictionary<string, BungeeBackendDto>
+                {
+                    ["lobby"] = new("127.0.0.1:25565", "&1Just another BungeeCord - Forced Host", false)
+                };
+                var initialConfig = BungeeConfigDefaults(exists: true) with
+                {
+                    Host = $"0.0.0.0:{defaultPort}",
+                    QueryPort = defaultPort,
+                    Servers = bungeeBackends,
+                    Priorities = new List<string> { bungeeBackends.Keys.First() }
+                };
+                var yamlPath = Path.Combine(serverPath, "config.yml");
+                await WriteBungeeConfigAsync(yamlPath, initialConfig, cancellationToken);
+            }
+        }
+        else
+        {
+            var defaultPort = GetNextAvailablePort(usedPorts, 25565);
+
+            // Write default server.properties
+            var defaultProperties = new Dictionary<string, string>
+            {
+                ["server-port"] = defaultPort.ToString(),
+                ["max-players"] = "20",
+                ["level-seed"] = "",
+                ["gamemode"] = "0",
+                ["difficulty"] = "1",
+                ["level-type"] = "DEFAULT",
+                ["level-name"] = "world",
+                ["max-build-height"] = "256",
+                ["generate-structures"] = "true",
+                ["generator-settings"] = "",
+                ["server-ip"] = "0.0.0.0",
+                ["enable-query"] = "false",
+                ["white-list"] = "true",
+                ["enforce-whitelist"] = "true"
+            };
+
+            await File.WriteAllTextAsync(propertiesPath, IniParser.WriteSimple(defaultProperties), cancellationToken);
+
+            // Determine TPS monitoring defaults based on server type
+            var tpsEnabled = "false";
+            var tpsCommand = "";
+            var serverTypeStr = (serverType ?? "").ToLowerInvariant();
+            switch (serverTypeStr)
+            {
+                case "forge":
+                    tpsEnabled = "true";
+                    tpsCommand = "/forge tps";
+                    break;
+                case "neoforge":
+                    tpsEnabled = "true";
+                    tpsCommand = "/neoforge tps";
+                    break;
+                case "paper":
+                case "spigot":
+                case "craftbukkit":
+                case "purpur":
+                    tpsEnabled = "true";
+                    tpsCommand = "/tps";
+                    break;
+                // fabric, quilt, vanilla, and anything else: default false
+            }
+
+            // Write default server.config
+            var defaultConfig = new Dictionary<string, Dictionary<string, string>>
+            {
+                ["display"] = new()
+                {
+                    ["name"] = request.Name
+                },
+                ["java"] = new()
+                {
+                    ["java_binary"] = "",
+                    ["java_xmx"] = "4096",
+                    ["java_xms"] = "4096"
+                },
+                ["minecraft"] = new()
+                {
+                    ["profile"] = "",
+                    ["unconventional"] = "false",
+                    ["lan_broadcast"] = "false"
+                },
+                ["onreboot"] = new()
+                {
+                    ["start"] = "false"
+                },
+                ["monitoring"] = new()
+                {
+                    ["tps_enabled"] = tpsEnabled,
+                    ["tps_command"] = tpsCommand
+                }
+            };
+
+            await File.WriteAllTextAsync(configPath, IniParser.WriteWithSections(defaultConfig), cancellationToken);
+        }
+
+        OwnershipHelper.TrySetOwnership(serverPath, _options.RunAsUid, _options.RunAsGid, _logger, recursive: true);
+        OwnershipHelper.TrySetOwnership(backupPath, _options.RunAsUid, _options.RunAsGid, _logger, recursive: true);
+        OwnershipHelper.TrySetOwnership(archivePath, _options.RunAsUid, _options.RunAsGid, _logger, recursive: true);
+
+        _logger.LogInformation("Created server {ServerName} ({DisplayName}) at {ServerPath}", directoryName, request.Name, serverPath);
+        // ServerName keys on the backend directory, as every other Discord event does
+        // (watchdog and jobs both report the on-disk name); the message carries the
+        // display name, which is what a reader in Discord recognises.
+        _discordWebhook.QueueEvent(new DiscordEvent(
+            "Server Created", $"{request.Name} was created.",
+            DiscordEventLevel.Success, directoryName, DateTimeOffset.UtcNow, DiscordEvents.Created));
+        try
+        {
+            await _telemetryService.ReportLifecycleEventAsync("server_created", null, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to report server_created telemetry event");
+        }
+        _telemetryReportTrigger.RequestImmediateReport();
+
+        return await GetServerAsync(directoryName, cancellationToken);
+    }
+
+    public async Task<ServerDetailDto> CloneServerAsync(
+        string sourceName,
+        string newName,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(newName))
+        {
+            throw new ArgumentException("New server name is required.");
+        }
+
+        var sourcePath = GetServerPath(sourceName);
+        if (!Directory.Exists(sourcePath))
+        {
+            throw new DirectoryNotFoundException($"Server '{sourceName}' not found");
+        }
+
+        // Same rule as creating one: what the user typed is the label, the directory is
+        // a slug. Without this a clone could still put a space (or worse) on disk, which
+        // would quietly make the "new directories are slugs" guarantee untrue.
+        var targetDirectory = GenerateServerDirectoryName(newName);
+        var targetPath = GetServerPath(targetDirectory);
+        if (Directory.Exists(targetPath))
+        {
+            throw new InvalidOperationException($"Server '{newName}' already exists");
+        }
+
+        var isRunning = await _processManager.IsServerRunningAsync(sourceName, cancellationToken);
+        if (isRunning)
+        {
+            throw new InvalidOperationException($"Cannot clone running server '{sourceName}'");
+        }
+
+        Directory.CreateDirectory(targetPath);
+        await CopyDirectoryAsync(sourcePath, targetPath, cancellationToken, new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "logs",
+            "crash-reports"
+        });
+
+        var backupPath = GetBackupPath(targetDirectory);
+        var archivePath = GetArchivePath(targetDirectory);
+        Directory.CreateDirectory(backupPath);
+        Directory.CreateDirectory(archivePath);
+
+        var propertiesPath = GetPropertiesPath(targetDirectory);
+        if (File.Exists(propertiesPath))
+        {
+            var properties = await GetServerPropertiesAsync(targetDirectory, cancellationToken);
+            var usedPorts = await GetUsedPortsAsync(excludeName: null, cancellationToken);
+            var defaultPort = GetNextAvailablePort(usedPorts, 25565);
+            properties["server-port"] = defaultPort.ToString();
+            await UpdateServerPropertiesAsync(targetDirectory, properties, cancellationToken);
+        }
+
+        // A clone is its own identity — don't carry over the source's label (issue #180).
+        var cloneConfigPath = GetConfigPath(targetDirectory);
+        if (File.Exists(cloneConfigPath))
+        {
+            var cloneContent = await File.ReadAllTextAsync(cloneConfigPath, cancellationToken);
+            var cloneSections = IniParser.ParseWithSections(cloneContent);
+            // A clone must never claim to be its source (issue #180), but it does need a
+            // label of its own — its directory is a slug, so without one the UI could
+            // only show "my-clone-7f3a". The name typed for the copy is that label.
+            cloneSections["display"] = new Dictionary<string, string> { ["name"] = newName };
+            // Update preferences are per-server (issue #83): a clone starts fresh. The
+            // jar filename still identifies the cloned software for detection.
+            cloneSections.Remove("updates");
+            await File.WriteAllTextAsync(cloneConfigPath, IniParser.WriteWithSections(cloneSections), cancellationToken);
+        }
+
+        OwnershipHelper.TrySetOwnership(targetPath, _options.RunAsUid, _options.RunAsGid, _logger, recursive: true);
+        OwnershipHelper.TrySetOwnership(backupPath, _options.RunAsUid, _options.RunAsGid, _logger, recursive: true);
+        OwnershipHelper.TrySetOwnership(archivePath, _options.RunAsUid, _options.RunAsGid, _logger, recursive: true);
+
+        _logger.LogInformation("Cloned server {SourceServer} to {TargetServer} ({DisplayName})", sourceName, targetDirectory, newName);
+        try
+        {
+            await _telemetryService.ReportLifecycleEventAsync("server_created", new { clone = true }, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to report server_created telemetry event for clone");
+        }
+        _telemetryReportTrigger.RequestImmediateReport();
+
+        return await GetServerAsync(targetDirectory, cancellationToken);
+    }
+
+    public async Task DeleteServerAsync(string name, CancellationToken cancellationToken)
+    {
+        var isRunning = await _processManager.IsServerRunningAsync(name, cancellationToken);
+        if (isRunning)
+        {
+            throw new InvalidOperationException($"Cannot delete running server '{name}'");
+        }
+
+        var serverPath = GetServerPath(name);
+        var backupPath = GetBackupPath(name);
+        var archivePath = GetArchivePath(name);
+
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        Directory.Delete(serverPath, recursive: true);
+        if (Directory.Exists(backupPath))
+            Directory.Delete(backupPath, recursive: true);
+        if (Directory.Exists(archivePath))
+            Directory.Delete(archivePath, recursive: true);
+
+        _logger.LogInformation("Deleted server {ServerName}", name);
+        _discordWebhook.QueueEvent(new DiscordEvent(
+            "Server Deleted", $"{name} was deleted.",
+            DiscordEventLevel.Warning, name, DateTimeOffset.UtcNow, DiscordEvents.Deleted));
+        try
+        {
+            await _telemetryService.ReportLifecycleEventAsync("server_deleted", null, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to report server_deleted telemetry event");
+        }
+        _telemetryReportTrigger.RequestImmediateReport();
+    }
+
+    public async Task<List<ServerDetailDto>> ListServersAsync(CancellationToken cancellationToken)
+    {
+        var serversDir = Path.Combine(_options.BaseDirectory, _options.ServersPathSegment);
+        if (!Directory.Exists(serversDir))
+        {
+            return new List<ServerDetailDto>();
+        }
+
+        var serverNames = Directory.GetDirectories(serversDir)
+            .Select(dir => Path.GetFileName(dir))
+            .Where(name => !string.IsNullOrEmpty(name))
+            .ToList();
+
+        var serverDetails = new List<ServerDetailDto>();
+        foreach (var name in serverNames)
+        {
+            try
+            {
+                var detail = await GetServerAsync(name!, cancellationToken);
+                serverDetails.Add(detail);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to get details for server {ServerName}", name);
+            }
+        }
+
+        return serverDetails;
+    }
+
+    public async Task<ServerHeartbeatDto> GetServerStatusAsync(string name, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        var processInfo = _processManager.GetServerProcess(name);
+        var status = processInfo?.JavaPid != null ? ServerStatusStrings.Running : ServerStatusStrings.Stopped;
+
+        // TODO: Add ping info when we implement MinecraftPing protocol
+        // TODO: Add memory info from /proc/{pid}/status
+
+        return new ServerHeartbeatDto(
+            name,
+            status,
+            processInfo?.JavaPid,
+            processInfo?.ScreenPid,
+            null, // ping
+            null  // memory
+        );
+    }
+
+    /// <summary>
+    /// Serializes the whole lifecycle - start, stop, kill and restart - per server.
+    /// Entries are keyed by server name and never removed: a SemaphoreSlim is a few
+    /// dozen bytes and the set is bounded by how many servers have ever been touched,
+    /// which is far cheaper than the alternative of disposing a gate somebody is
+    /// currently holding.
+    /// </summary>
+    /// <remarks>
+    /// Static on purpose. IServerService is registered scoped, so every caller that can
+    /// race here - the action endpoint, WatchdogService, StartupServerService and
+    /// CronSchedulerService - resolves its own ServerService instance. A per-instance
+    /// gate would be uncontended and would serialize nothing.
+    ///
+    /// Gating starts alone only closed half the window. Stop sends its command and then
+    /// polls for the process to disappear, and neither it nor kill took the gate, so a
+    /// start could run against a server in the middle of shutting down - and a stop
+    /// could be sent to a JVM that was still coming up. Both operate on the same world
+    /// directory, which is the thing that must never have two writers.
+    /// </remarks>
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> LifecycleGates =
+        new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// How long a lifecycle call waits for one already in flight before giving up.
+    /// </summary>
+    /// <remarks>
+    /// Bounded rather than infinite because a stop legitimately holds the gate for its
+    /// whole shutdown timeout - up to five minutes. Blocking a start behind that would
+    /// park an HTTP request until a proxy in front of MineOS gave up on it, so the
+    /// caller is told the server is busy instead. Every caller already handles the
+    /// InvalidOperationException this shares with "already running", which the action
+    /// endpoint turns into a 409.
+    /// </remarks>
+    private static readonly TimeSpan LifecycleWait = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Takes the lifecycle gate for one server, or throws if another operation holds it.
+    /// </summary>
+    private static async Task<IDisposable> EnterLifecycleAsync(
+        string name, CancellationToken cancellationToken)
+    {
+        var gate = LifecycleGates.GetOrAdd(name, _ => new SemaphoreSlim(1, 1));
+        if (!await gate.WaitAsync(LifecycleWait, cancellationToken))
+        {
+            throw new InvalidOperationException(
+                $"Server '{name}' is busy: another start, stop or restart is already in progress");
+        }
+
+        return new LifecycleLease(gate);
+    }
+
+    /// <summary>Releases the lifecycle gate exactly once, however the caller unwinds.</summary>
+    private sealed class LifecycleLease : IDisposable
+    {
+        private SemaphoreSlim? _gate;
+
+        public LifecycleLease(SemaphoreSlim gate) => _gate = gate;
+
+        public void Dispose() => Interlocked.Exchange(ref _gate, null)?.Release();
+    }
+
+    /// <summary>
+    /// Starts a server, refusing if it is already running.
+    /// </summary>
+    /// <remarks>
+    /// The whole body runs under a per-server gate because the "already running" check is
+    /// a check-then-act. A freshly launched screen session does not appear in the process
+    /// table instantly, and the work between the check and the launch is not trivial - it
+    /// reads server.config, resolves a Java binary (which opens and inspects the jar) and
+    /// chowns the log directory. Two callers arriving inside that window both saw "not
+    /// running" and both launched. On a proxy the loser dies with EADDRINUSE, which is
+    /// noisy but harmless; on a game server it means two JVMs writing one world directory,
+    /// which is how region files get corrupted.
+    ///
+    /// The gate is held through VerifyServerStartedAsync, not just the launch, so it is
+    /// released only once the process is actually observable. Releasing at the screen call
+    /// would reopen the same window a few hundred milliseconds later.
+    /// </remarks>
+    public async Task StartServerAsync(string name, CancellationToken cancellationToken)
+    {
+        using var _ = await EnterLifecycleAsync(name, cancellationToken);
+        await StartServerCoreAsync(name, cancellationToken);
+    }
+
+    private async Task StartServerCoreAsync(string name, CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("StartServerAsync requested for {ServerName}", name);
+        var isRunning = await _processManager.IsServerRunningAsync(name, cancellationToken);
+        if (isRunning)
+        {
+            throw new InvalidOperationException($"Server '{name}' is already running");
+        }
+
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        ClearStopRequested(name);
+
+        var serverType = DetectServerType(name);
+        var uid = _options.RunAsUid;
+        var gid = _options.RunAsGid;
+
+        await EnsureExecutableAvailableAsync("screen", "-v", "GNU screen", cancellationToken);
+
+        var logDir = Path.Combine(serverPath, "logs");
+        Directory.CreateDirectory(logDir);
+        await OwnershipHelper.ChangeOwnershipAsync(logDir, uid, gid, _logger, cancellationToken);
+        var startupLogPath = Path.Combine(logDir, "startup.log");
+
+        string shellCommand;
+        var startTime = DateTimeOffset.UtcNow;
+        var startupStamp = $"[{startTime:O}] Launching {name}";
+        var startupLogArg = EscapeBashArgument(startupLogPath);
+        var escapedServerPath = EscapeBashArgument(serverPath);
+
+        if (serverType == "bedrock")
+        {
+            var bedrockBinary = Path.Combine(serverPath, "bedrock_server");
+            if (!File.Exists(bedrockBinary))
+            {
+                throw new InvalidOperationException($"Bedrock server binary not found at {bedrockBinary}. Download a Bedrock server profile first.");
+            }
+
+            // Ensure binary is executable
+            try
+            {
+                var chmodPsi = new ProcessStartInfo("chmod", $"+x {EscapeBashArgument(bedrockBinary)}")
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using var chmodProcess = Process.Start(chmodPsi);
+                if (chmodProcess != null)
+                    await chmodProcess.WaitForExitAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to chmod bedrock_server for {ServerName}", name);
+            }
+
+            _logger.LogInformation("Starting Bedrock server {ServerName} with binary {Binary}", name, bedrockBinary);
+
+            // Bedrock needs LD_LIBRARY_PATH set to its own directory
+            var ldPath = $"LD_LIBRARY_PATH={escapedServerPath}";
+            var envVar = $"MINEOS_SERVER={EscapeBashArgument(name)}";
+            shellCommand = $"cd {escapedServerPath} && echo {EscapeBashArgument(startupStamp)} >> {startupLogArg}; export {ldPath}; export {envVar}; exec ./bedrock_server >> {startupLogArg} 2>&1";
+        }
+        else
+        {
+            var isProxy = serverType == "proxy";
+
+            // Read server config to build start arguments
+            var config = await GetServerConfigAsync(name, cancellationToken);
+            string? javaBinary = config.Java.JavaBinary;
+            var jarFile = config.Java.JarFile;
+            if (string.IsNullOrEmpty(javaBinary) || javaBinary == "java")
+            {
+                if (isProxy)
+                {
+                    // Proxy jars carry no MC version, so read the requirement off the jar
+                    // itself. Velocity's Main-Class IS the proxy, and its bytecode target
+                    // moves between releases: 3.4.0 targets Java 17, 3.5.1 targets 21,
+                    // 4.x targets 25. Anything pinned to one number breaks the others.
+                    javaBinary = ResolveJavaBinaryFromJar(serverPath, jarFile, name);
+                }
+
+                if (string.IsNullOrEmpty(javaBinary) && isProxy)
+                {
+                    // Unreadable jar: Java 21 has been the Velocity floor since 3.5.0,
+                    // and newer runtimes are accepted when 21 is absent.
+                    javaBinary = FindJavaBinary(JavaFallbackOrder(21));
+                    _logger.LogInformation("Fell back to Java 21+ binary for proxy {Server}: {JavaBinary}",
+                        name, javaBinary);
+                }
+                else if (string.IsNullOrEmpty(javaBinary))
+                {
+                    // Auto-detect Java version from the server's Minecraft version
+                    string? mcVersion = null;
+                    try
+                    {
+                        var props = await GetServerPropertiesAsync(name, cancellationToken);
+                        // server.properties doesn't have MC version, but the profile might
+                    }
+                    catch { /* no properties file yet */ }
+
+                    // Try to extract MC version from profile name or jar filename
+                    var profile = config.Minecraft.Profile ?? "";
+                    var jar = config.Java.JarFile ?? "";
+                    var versionMatch = System.Text.RegularExpressions.Regex.Match(
+                        profile + " " + jar, @"(\d+\.\d+(?:\.\d+)?)");
+                    if (versionMatch.Success)
+                        mcVersion = versionMatch.Groups[1].Value;
+
+                    javaBinary = ResolveJavaBinary(mcVersion);
+                    _logger.LogInformation("Auto-resolved Java binary for {Server} (MC {Version}): {JavaBinary}",
+                        name, mcVersion ?? "unknown", javaBinary);
+                }
+            }
+
+            _logger.LogInformation(
+                "Server config for {ServerName}: javaBinary={JavaBinary} jarFile={JarFile} xmx={Xmx} xms={Xms}",
+                name,
+                javaBinary,
+                jarFile ?? "<null>",
+                config.Java.JavaXmx,
+                config.Java.JavaXms);
+
+            if (string.IsNullOrEmpty(jarFile))
+            {
+                throw new InvalidOperationException($"Server '{name}' has no JAR file configured");
+            }
+
+            if (!isProxy)
+            {
+                await EnsureEulaAcceptedAsync(serverPath, cancellationToken);
+            }
+            await EnsureExecutableAvailableAsync(javaBinary, "-version", "Java runtime", cancellationToken);
+
+            // Check if using modern Forge @argfile syntax
+            var isArgFileSyntax = jarFile.TrimStart().StartsWith("@");
+
+            if (isArgFileSyntax)
+            {
+                var argFiles = jarFile.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                foreach (var argFile in argFiles)
+                {
+                    var filePath = Path.Combine(serverPath, argFile.TrimStart('@'));
+                    if (!File.Exists(filePath))
+                    {
+                        throw new InvalidOperationException($"Forge argument file not found: {filePath}");
+                    }
+                }
+                _logger.LogInformation("Using Forge @argfile syntax for {ServerName}: {ArgFiles}", name, jarFile);
+            }
+            else
+            {
+                var resolvedJarPath = ResolveJarPath(serverPath, jarFile);
+                _logger.LogInformation("Resolved JAR path for {ServerName}: {JarPath}", name, resolvedJarPath);
+                if (!File.Exists(resolvedJarPath))
+                {
+                    throw new InvalidOperationException($"Configured JAR file not found: {resolvedJarPath}");
+                }
+            }
+
+            // Build Java command arguments
+            var javaArgs = new List<string>
+            {
+                javaBinary,
+                "-server",
+                $"-Dmineos.server={name}"
+            };
+
+            if (config.Java.JavaXmx > 0)
+                javaArgs.Add($"-Xmx{config.Java.JavaXmx}M");
+            if (config.Java.JavaXms > 0)
+                javaArgs.Add($"-Xms{config.Java.JavaXms}M");
+
+            if (!string.IsNullOrEmpty(config.Java.JavaTweaks))
+            {
+                javaArgs.AddRange(config.Java.JavaTweaks.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+            }
+
+            if (isArgFileSyntax)
+            {
+                javaArgs.AddRange(jarFile.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+            }
+            else
+            {
+                javaArgs.Add("-jar");
+                javaArgs.Add(ResolveJarPath(serverPath, jarFile));
+            }
+
+            if (!string.IsNullOrEmpty(config.Java.JarArgs))
+            {
+                javaArgs.AddRange(config.Java.JarArgs.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+            }
+            else if (!config.Minecraft.Unconventional)
+            {
+                javaArgs.Add("nogui");
+            }
+
+            var javaCommand = string.Join(" ", javaArgs.Select(EscapeBashArgument));
+            _logger.LogInformation("Java command: {JavaCommand}", javaCommand);
+            shellCommand = $"cd {escapedServerPath} && echo {EscapeBashArgument(startupStamp)} >> {startupLogArg}; exec {javaCommand} >> {startupLogArg} 2>&1";
+        }
+
+        var args = new List<string>
+        {
+            "-dmS",
+            $"mc-{name}",
+            "bash",
+            "-lc",
+            shellCommand
+        };
+
+        _logger.LogInformation(
+            "Starting screen for {ServerName} in {WorkingDirectory}. Args: {Args}",
+            name,
+            serverPath,
+            string.Join(' ', args));
+        _logger.LogInformation("Startup log file: {StartupLogPath}", startupLogPath);
+        await _processManager.StartScreenSessionAsync(name, args.ToArray(), uid, gid, serverPath, cancellationToken);
+
+        await VerifyServerStartedAsync(name, serverPath, startTime, startupLogPath, cancellationToken);
+        ClearRestartRequired(name);
+        _logger.LogInformation("Started server {ServerName}", name);
+        _discordWebhook.QueueEvent(new DiscordEvent(
+            "Server Started", $"{name} is now running.",
+            DiscordEventLevel.Success, name, DateTimeOffset.UtcNow, DiscordEvents.Started));
+    }
+
+    public async Task StopServerAsync(string name, int timeoutSeconds, CancellationToken cancellationToken)
+    {
+        using var _ = await EnterLifecycleAsync(name, cancellationToken);
+        await StopServerCoreAsync(name, timeoutSeconds, cancellationToken);
+    }
+
+    private async Task StopServerCoreAsync(string name, int timeoutSeconds, CancellationToken cancellationToken)
+    {
+        var isRunning = await _processManager.IsServerRunningAsync(name, cancellationToken);
+        if (!isRunning)
+        {
+            throw new InvalidOperationException($"Server '{name}' is not running");
+        }
+
+        await MarkStopRequestedAsync(name);
+
+        var uid = _options.RunAsUid;
+        var gid = _options.RunAsGid;
+
+        // Send stop command — Velocity uses "end", backend MC servers use "stop"
+        var stopCommand = DetectServerType(name) == "proxy" ? "end" : "stop";
+        await _processManager.SendCommandAsync(name, stopCommand, uid, gid, cancellationToken);
+
+        // Wait for process to stop
+        var timeout = TimeSpan.FromSeconds(timeoutSeconds > 0 ? timeoutSeconds : 300);
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        while (stopwatch.Elapsed < timeout)
+        {
+            await Task.Delay(200, cancellationToken);
+            isRunning = await _processManager.IsServerRunningAsync(name, cancellationToken);
+            if (!isRunning)
+            {
+                _logger.LogInformation("Server {ServerName} stopped gracefully", name);
+                _discordWebhook.QueueEvent(new DiscordEvent(
+                    "Server Stopped", $"{name} was stopped gracefully.",
+                    DiscordEventLevel.Info, name, DateTimeOffset.UtcNow, DiscordEvents.Stopped));
+                return;
+            }
+        }
+
+        throw new TimeoutException($"Server '{name}' did not stop within {timeoutSeconds} seconds");
+    }
+
+    /// <summary>
+    /// Stops a server and starts it again, as one operation.
+    /// </summary>
+    /// <remarks>
+    /// Holds the lifecycle gate across both halves and calls the core methods, which do
+    /// not take it - SemaphoreSlim is not reentrant, so calling the public StopServerAsync
+    /// and StartServerAsync from in here would deadlock against itself.
+    ///
+    /// Taking it once is the point: a restart that released between the stop and the
+    /// start let another caller win the gate in the gap and start the server, after which
+    /// this one failed with "already running" on a server that was, confusingly, running.
+    /// </remarks>
+    public async Task RestartServerAsync(string name, int timeoutSeconds, CancellationToken cancellationToken)
+    {
+        using var _ = await EnterLifecycleAsync(name, cancellationToken);
+
+        await StopServerCoreAsync(name, timeoutSeconds, cancellationToken);
+        await Task.Delay(1000, cancellationToken); // Brief pause between stop and start
+        await StartServerCoreAsync(name, cancellationToken);
+
+        _logger.LogInformation("Restarted server {ServerName}", name);
+    }
+
+    public async Task KillServerAsync(string name, CancellationToken cancellationToken)
+    {
+        using var _ = await EnterLifecycleAsync(name, cancellationToken);
+        await KillServerCoreAsync(name, cancellationToken);
+    }
+
+    private async Task KillServerCoreAsync(string name, CancellationToken cancellationToken)
+    {
+        var processInfo = _processManager.GetServerProcess(name);
+        if (processInfo?.JavaPid == null)
+        {
+            throw new InvalidOperationException($"Server '{name}' is not running");
+        }
+
+        await MarkStopRequestedAsync(name);
+        await _processManager.KillProcessAsync(processInfo.JavaPid.Value, cancellationToken);
+
+        _logger.LogWarning("Forcefully killed server {ServerName}", name);
+        _discordWebhook.QueueEvent(new DiscordEvent("Server Stopped", $"{name} was forcefully stopped.",
+            DiscordEventLevel.Warning, name, DateTimeOffset.UtcNow, DiscordEvents.Stopped));
+    }
+
+    public async Task<Dictionary<string, string>> GetServerPropertiesAsync(string name, CancellationToken cancellationToken)
+    {
+        var propertiesPath = GetPropertiesPath(name);
+        if (!File.Exists(propertiesPath))
+        {
+            return new Dictionary<string, string>();
+        }
+
+        var content = await File.ReadAllTextAsync(propertiesPath, cancellationToken);
+        return IniParser.ParseSimple(content);
+    }
+
+    public async Task UpdateServerPropertiesAsync(string name, Dictionary<string, string> properties, CancellationToken cancellationToken)
+    {
+        var existingProperties = await GetServerPropertiesAsync(name, cancellationToken);
+        var existingWorld = GetActiveWorldName(existingProperties);
+        var updatedWorld = GetActiveWorldName(properties);
+        var worldChanged = !string.Equals(existingWorld, updatedWorld, StringComparison.OrdinalIgnoreCase);
+
+        if (properties.TryGetValue("server-port", out var portValue))
+        {
+            if (!int.TryParse(portValue, out var port) || port < 1 || port > 65535)
+            {
+                throw new InvalidOperationException("Server port must be a number between 1 and 65535.");
+            }
+
+            var usedPorts = await GetUsedPortsAsync(name, cancellationToken);
+            if (usedPorts.Contains(port))
+            {
+                throw new InvalidOperationException($"Port {port} is already in use by another server.");
+            }
+        }
+
+        var propertiesPath = GetPropertiesPath(name);
+        var content = IniParser.WriteSimple(properties);
+        await File.WriteAllTextAsync(propertiesPath, content, cancellationToken);
+        await OwnershipHelper.ChangeOwnershipAsync(propertiesPath, _options.RunAsUid, _options.RunAsGid, _logger, cancellationToken);
+
+        if (worldChanged)
+        {
+            await MarkRestartRequiredAsync(name);
+        }
+
+        _logger.LogInformation("Updated server.properties for {ServerName}", name);
+    }
+
+    private string GetVelocityTomlPath(string name) =>
+        Path.Combine(GetServerPath(name), "velocity.toml");
+
+    private string GetBungeeConfigPath(string name) =>
+        Path.Combine(GetServerPath(name), "config.yml");
+
+    private static (string Host, int Port)? ParseHostPort(string bind)
+    {
+        // Bind format is "<host>:<port>" e.g. "0.0.0.0:25577", with IPv6 like
+        // "[::]:25577". Split on the LAST colon so IPv6 brackets don't break.
+        if (string.IsNullOrWhiteSpace(bind))
+        {
+            return null;
+        }
+        var lastColon = bind.LastIndexOf(':');
+        if (lastColon <= 0 || lastColon == bind.Length - 1)
+        {
+            return null;
+        }
+        if (!int.TryParse(bind[(lastColon + 1)..], out var port) || port < 1 || port > 65535)
+        {
+            return null;
+        }
+        var host = bind[..lastColon].Trim('[', ']');
+        if (string.IsNullOrWhiteSpace(host) || host == "0.0.0.0" || host == "::")
+        {
+            host = "127.0.0.1";
+        }
+        return (host, port);
+    }
+
+    private static string? ReadFirstListenerHost(string yamlContent)
+    {
+        var stream = new YamlStream();
+        using var reader = new StringReader(yamlContent);
+        stream.Load(reader);
+        if (stream.Documents.Count == 0 ||
+            stream.Documents[0].RootNode is not YamlMappingNode root)
+        {
+            return null;
+        }
+        if (!root.Children.TryGetValue(new YamlScalarNode("listeners"), out var listenersNode) ||
+            listenersNode is not YamlSequenceNode listeners ||
+            listeners.Children.Count == 0 ||
+            listeners.Children[0] is not YamlMappingNode first)
+        {
+            return null;
+        }
+        if (first.Children.TryGetValue(new YamlScalarNode("host"), out var hostNode) &&
+            hostNode is YamlScalarNode hostScalar)
+        {
+            return hostScalar.Value;
+        }
+        return null;
+    }
+
+    public async Task<(string Host, int Port)?> GetServerListenEndpointAsync(string name, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+        {
+            return null;
+        }
+
+        if (DetectServerType(name) == "proxy")
+        {
+            // Try Velocity (velocity.toml) first; fall back to BungeeCord (config.yml).
+            var tomlPath = GetVelocityTomlPath(name);
+            if (File.Exists(tomlPath))
+            {
+                try
+                {
+                    var content = await File.ReadAllTextAsync(tomlPath, cancellationToken);
+                    var model = Toml.ToModel(content);
+                    if (model.TryGetValue("bind", out var bindObj) && bindObj is string bind)
+                    {
+                        return ParseHostPort(bind);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to parse velocity.toml for {ServerName}", name);
+                }
+            }
+
+            var yamlPath = GetBungeeConfigPath(name);
+            if (File.Exists(yamlPath))
+            {
+                try
+                {
+                    var content = await File.ReadAllTextAsync(yamlPath, cancellationToken);
+                    var bind = ReadFirstListenerHost(content);
+                    if (!string.IsNullOrWhiteSpace(bind))
+                    {
+                        return ParseHostPort(bind);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to parse config.yml for {ServerName}", name);
+                }
+            }
+
+            return null;
+        }
+
+        // Java + bedrock: read server.properties
+        var properties = await GetServerPropertiesAsync(name, cancellationToken);
+        if (!properties.TryGetValue("server-port", out var portStr) ||
+            !int.TryParse(portStr, out var jPort) ||
+            jPort < 1 || jPort > 65535)
+        {
+            return null;
+        }
+        var jHost = "127.0.0.1";
+        if (properties.TryGetValue("server-ip", out var ip) &&
+            !string.IsNullOrWhiteSpace(ip) &&
+            !ip.Equals("0.0.0.0", StringComparison.OrdinalIgnoreCase))
+        {
+            jHost = ip;
+        }
+        return (jHost, jPort);
+    }
+
+    public async Task<VelocityConfigDto> GetVelocityConfigAsync(string name, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        var tomlPath = GetVelocityTomlPath(name);
+        if (!File.Exists(tomlPath))
+        {
+            return VelocityConfigDefaults(exists: false);
+        }
+
+        var content = await File.ReadAllTextAsync(tomlPath, cancellationToken);
+        var model = Toml.ToModel(content);
+
+        var defaults = VelocityConfigDefaults(exists: true);
+        return defaults with
+        {
+            Bind = TomlGetString(model, "bind", defaults.Bind),
+            Motd = TomlGetString(model, "motd", defaults.Motd),
+            ShowMaxPlayers = TomlGetInt(model, "show-max-players", defaults.ShowMaxPlayers),
+            OnlineMode = TomlGetBool(model, "online-mode", defaults.OnlineMode),
+            ForceKeyAuthentication = TomlGetBool(model, "force-key-authentication", defaults.ForceKeyAuthentication),
+            PreventClientProxyConnections = TomlGetBool(model, "prevent-client-proxy-connections", defaults.PreventClientProxyConnections),
+            PlayerInfoForwardingMode = TomlGetString(model, "player-info-forwarding-mode", defaults.PlayerInfoForwardingMode),
+            ForwardingSecretFile = TomlGetString(model, "forwarding-secret-file", defaults.ForwardingSecretFile),
+            AnnounceForge = TomlGetBool(model, "announce-forge", defaults.AnnounceForge),
+            KickExistingPlayers = TomlGetBool(model, "kick-existing-players", defaults.KickExistingPlayers),
+            PingPassthrough = TomlGetString(model, "ping-passthrough", defaults.PingPassthrough),
+            EnablePlayerAddressLogging = TomlGetBool(model, "enable-player-address-logging", defaults.EnablePlayerAddressLogging),
+            Servers = ReadServersTable(model),
+            Try = ReadTryList(model),
+            ForcedHosts = ReadForcedHostsTable(model)
+        };
+    }
+
+    public async Task UpdateVelocityConfigAsync(string name, VelocityConfigDto config, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        if (DetectServerType(name) != "proxy")
+        {
+            throw new InvalidOperationException($"Server '{name}' is not a proxy server");
+        }
+
+        var tomlPath = GetVelocityTomlPath(name);
+        await WriteVelocityTomlAsync(tomlPath, config, cancellationToken);
+        await MarkRestartRequiredAsync(name);
+        _logger.LogInformation("Updated velocity.toml for {ServerName}", name);
+    }
+
+    private async Task WriteVelocityTomlAsync(string tomlPath, VelocityConfigDto config, CancellationToken cancellationToken)
+    {
+        // Round-trip: load existing model (or start fresh), apply our known fields,
+        // preserve any unknown sections like [advanced] and [query].
+        TomlTable model;
+        if (File.Exists(tomlPath))
+        {
+            var content = await File.ReadAllTextAsync(tomlPath, cancellationToken);
+            model = Toml.ToModel(content);
+        }
+        else
+        {
+            model = new TomlTable();
+            // Match current Velocity 3.x. Writing an old version (e.g. "1.0") makes
+            // Velocity run its config migration on first boot, which logs a
+            // deprecation warning and escapes the MiniMessage MOTD.
+            model["config-version"] = "2.7";
+        }
+
+        model["bind"] = config.Bind;
+        model["motd"] = config.Motd;
+        model["show-max-players"] = (long)config.ShowMaxPlayers;
+        model["online-mode"] = config.OnlineMode;
+        model["force-key-authentication"] = config.ForceKeyAuthentication;
+        model["prevent-client-proxy-connections"] = config.PreventClientProxyConnections;
+        model["player-info-forwarding-mode"] = config.PlayerInfoForwardingMode;
+        model["forwarding-secret-file"] = config.ForwardingSecretFile;
+        model["announce-forge"] = config.AnnounceForge;
+        model["kick-existing-players"] = config.KickExistingPlayers;
+        model["ping-passthrough"] = config.PingPassthrough;
+        model["enable-player-address-logging"] = config.EnablePlayerAddressLogging;
+
+        var serversTable = new TomlTable();
+        foreach (var (key, value) in config.Servers)
+        {
+            serversTable[key] = value;
+        }
+        var tryArray = new TomlArray();
+        foreach (var entry in config.Try)
+        {
+            tryArray.Add(entry);
+        }
+        serversTable["try"] = tryArray;
+        model["servers"] = serversTable;
+
+        // Always emit [forced-hosts] (even when empty). Velocity falls back to
+        // its bundled default config when the table is missing entirely —
+        // that default references factions.example.com / minigames.example.com
+        // and fails startup.
+        var forcedHostsTable = new TomlTable();
+        foreach (var (hostname, serverList) in config.ForcedHosts)
+        {
+            var arr = new TomlArray();
+            foreach (var s in serverList)
+            {
+                arr.Add(s);
+            }
+            forcedHostsTable[hostname] = arr;
+        }
+        model["forced-hosts"] = forcedHostsTable;
+
+        var output = Toml.FromModel(model);
+        await File.WriteAllTextAsync(tomlPath, output, cancellationToken);
+        await OwnershipHelper.ChangeOwnershipAsync(tomlPath, _options.RunAsUid, _options.RunAsGid, _logger, cancellationToken);
+    }
+
+    private static VelocityConfigDto VelocityConfigDefaults(bool exists)
+    {
+        return new VelocityConfigDto(
+            Exists: exists,
+            Bind: "0.0.0.0:25577",
+            Motd: "<#09add3>A Velocity Server",
+            ShowMaxPlayers: 500,
+            OnlineMode: true,
+            ForceKeyAuthentication: true,
+            PreventClientProxyConnections: false,
+            // Verified forwarding by default. "none" leaves backends unable to
+            // check who a forwarded player claims to be, which combined with the
+            // online-mode=false those backends require means anyone reaching one
+            // directly can join as anyone. Existing proxies keep whatever their
+            // velocity.toml already says — this default applies to new ones.
+            PlayerInfoForwardingMode: "modern",
+            ForwardingSecretFile: "forwarding.secret",
+            AnnounceForge: false,
+            KickExistingPlayers: false,
+            PingPassthrough: "DISABLED",
+            EnablePlayerAddressLogging: true,
+            Servers: new Dictionary<string, string>(),
+            Try: new List<string>(),
+            ForcedHosts: new Dictionary<string, List<string>>());
+    }
+
+    private static string TomlGetString(TomlTable model, string key, string fallback)
+    {
+        return model.TryGetValue(key, out var value) && value is string s ? s : fallback;
+    }
+
+    private static int TomlGetInt(TomlTable model, string key, int fallback)
+    {
+        if (!model.TryGetValue(key, out var value))
+            return fallback;
+        return value switch
+        {
+            long l => (int)l,
+            int i => i,
+            _ => fallback
+        };
+    }
+
+    private static bool TomlGetBool(TomlTable model, string key, bool fallback)
+    {
+        return model.TryGetValue(key, out var value) && value is bool b ? b : fallback;
+    }
+
+    private static Dictionary<string, string> ReadServersTable(TomlTable model)
+    {
+        var result = new Dictionary<string, string>();
+        if (!model.TryGetValue("servers", out var serversObj) || serversObj is not TomlTable servers)
+            return result;
+
+        foreach (var (key, value) in servers)
+        {
+            // Skip the "try" entry — it's a list, not a backend mapping.
+            if (key == "try" || value is TomlArray)
+                continue;
+            if (value is string s)
+                result[key] = s;
+        }
+        return result;
+    }
+
+    private static List<string> ReadTryList(TomlTable model)
+    {
+        var result = new List<string>();
+        if (!model.TryGetValue("servers", out var serversObj) || serversObj is not TomlTable servers)
+            return result;
+        if (!servers.TryGetValue("try", out var tryObj) || tryObj is not TomlArray tryArr)
+            return result;
+        foreach (var item in tryArr)
+        {
+            if (item is string s)
+                result.Add(s);
+        }
+        return result;
+    }
+
+    private static Dictionary<string, List<string>> ReadForcedHostsTable(TomlTable model)
+    {
+        var result = new Dictionary<string, List<string>>();
+        if (!model.TryGetValue("forced-hosts", out var fhObj) || fhObj is not TomlTable forcedHosts)
+            return result;
+        foreach (var (hostname, value) in forcedHosts)
+        {
+            if (value is not TomlArray arr)
+                continue;
+            var list = new List<string>();
+            foreach (var item in arr)
+            {
+                if (item is string s)
+                    list.Add(s);
+            }
+            result[hostname] = list;
+        }
+        return result;
+    }
+
+    public async Task<BungeeConfigDto> GetBungeeConfigAsync(string name, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        var yamlPath = GetBungeeConfigPath(name);
+        if (!File.Exists(yamlPath))
+        {
+            return BungeeConfigDefaults(exists: false);
+        }
+
+        var content = await File.ReadAllTextAsync(yamlPath, cancellationToken);
+        try
+        {
+            return ParseBungeeConfig(content);
+        }
+        catch (YamlDotNet.Core.YamlException ex)
+        {
+            // Translated here rather than caught in the Api layer: YamlException is
+            // an Infrastructure detail, and letting it escape produced an opaque 500
+            // that took the whole Properties tab down with no explanation.
+            throw new InvalidOperationException(
+                $"config.yml for '{name}' is not valid YAML: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>
+    /// Maps BungeeCord's config.yml text onto <see cref="BungeeConfigDto"/>. Keys the
+    /// file omits fall back to <see cref="BungeeConfigDefaults"/>. Malformed YAML throws
+    /// rather than silently yielding defaults — returning defaults would let the next
+    /// save overwrite a config the user still has content in.
+    /// </summary>
+    public static BungeeConfigDto ParseBungeeConfig(string yaml)
+    {
+        var stream = new YamlStream();
+        using var reader = new StringReader(yaml);
+        stream.Load(reader);
+
+        var defaults = BungeeConfigDefaults(exists: true);
+        if (stream.Documents.Count == 0 ||
+            stream.Documents[0].RootNode is not YamlMappingNode root)
+        {
+            return defaults;
+        }
+
+        var listener = GetFirstListener(root);
+
+        return defaults with
+        {
+            OnlineMode = YamlGetBool(root, "online_mode", defaults.OnlineMode),
+            IpForward = YamlGetBool(root, "ip_forward", defaults.IpForward),
+            PlayerLimit = YamlGetInt(root, "player_limit", defaults.PlayerLimit),
+            Timeout = YamlGetInt(root, "timeout", defaults.Timeout),
+            NetworkCompressionThreshold = YamlGetInt(root, "network_compression_threshold", defaults.NetworkCompressionThreshold),
+            ForgeSupport = YamlGetBool(root, "forge_support", defaults.ForgeSupport),
+            LogCommands = YamlGetBool(root, "log_commands", defaults.LogCommands),
+            LogPings = YamlGetBool(root, "log_pings", defaults.LogPings),
+            ConnectionThrottle = YamlGetInt(root, "connection_throttle", defaults.ConnectionThrottle),
+            ConnectionThrottleLimit = YamlGetInt(root, "connection_throttle_limit", defaults.ConnectionThrottleLimit),
+            Host = listener is null ? defaults.Host : YamlGetString(listener, "host", defaults.Host),
+            Motd = listener is null ? defaults.Motd : YamlGetString(listener, "motd", defaults.Motd),
+            MaxPlayers = listener is null ? defaults.MaxPlayers : YamlGetInt(listener, "max_players", defaults.MaxPlayers),
+            QueryEnabled = listener is not null && YamlGetBool(listener, "query_enabled", defaults.QueryEnabled),
+            QueryPort = listener is null ? defaults.QueryPort : YamlGetInt(listener, "query_port", defaults.QueryPort),
+            PingPassthrough = listener is not null && YamlGetBool(listener, "ping_passthrough", defaults.PingPassthrough),
+            ForceDefaultServer = listener is not null && YamlGetBool(listener, "force_default_server", defaults.ForceDefaultServer),
+            TabList = listener is null ? defaults.TabList : YamlGetString(listener, "tab_list", defaults.TabList),
+            ProxyProtocol = listener is not null && YamlGetBool(listener, "proxy_protocol", defaults.ProxyProtocol),
+            Priorities = listener is null ? new List<string>() : ReadPriorities(listener),
+            ForcedHosts = listener is null ? new Dictionary<string, string>() : ReadBungeeForcedHosts(listener),
+            Servers = ReadBungeeServers(root)
+        };
+    }
+
+    public async Task UpdateBungeeConfigAsync(string name, BungeeConfigDto config, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        if (DetectServerType(name) != "proxy")
+        {
+            throw new InvalidOperationException($"Server '{name}' is not a proxy server");
+        }
+
+        var yamlPath = GetBungeeConfigPath(name);
+        await WriteBungeeConfigAsync(yamlPath, config, cancellationToken);
+        await MarkRestartRequiredAsync(name);
+        _logger.LogInformation("Updated config.yml for {ServerName}", name);
+    }
+
+    private async Task WriteBungeeConfigAsync(string yamlPath, BungeeConfigDto config, CancellationToken cancellationToken)
+    {
+        var existing = File.Exists(yamlPath)
+            ? await File.ReadAllTextAsync(yamlPath, cancellationToken)
+            : null;
+
+        await File.WriteAllTextAsync(yamlPath, SerializeBungeeConfig(config, existing), cancellationToken);
+        await OwnershipHelper.ChangeOwnershipAsync(yamlPath, _options.RunAsUid, _options.RunAsGid, _logger, cancellationToken);
+    }
+
+    /// <summary>
+    /// Renders <paramref name="config"/> as config.yml text. When <paramref name="existingYaml"/>
+    /// is supplied its tree is edited in place rather than replaced, so keys the editor does not
+    /// model — groups, permissions, disabled_commands, the stats UUID, listeners beyond the
+    /// first — survive an edit cycle instead of being dropped.
+    /// </summary>
+    public static string SerializeBungeeConfig(BungeeConfigDto config, string? existingYaml)
+    {
+        YamlMappingNode root;
+        if (!string.IsNullOrWhiteSpace(existingYaml))
+        {
+            var stream = new YamlStream();
+            using var reader = new StringReader(existingYaml);
+            stream.Load(reader);
+            root = stream.Documents.Count > 0 && stream.Documents[0].RootNode is YamlMappingNode m
+                ? m
+                : new YamlMappingNode();
+        }
+        else
+        {
+            root = new YamlMappingNode();
+        }
+
+        SetScalar(root, "online_mode", config.OnlineMode);
+        SetScalar(root, "ip_forward", config.IpForward);
+        SetScalar(root, "player_limit", config.PlayerLimit);
+        SetScalar(root, "timeout", config.Timeout);
+        SetScalar(root, "network_compression_threshold", config.NetworkCompressionThreshold);
+        SetScalar(root, "forge_support", config.ForgeSupport);
+        SetScalar(root, "log_commands", config.LogCommands);
+        SetScalar(root, "log_pings", config.LogPings);
+        SetScalar(root, "connection_throttle", config.ConnectionThrottle);
+        SetScalar(root, "connection_throttle_limit", config.ConnectionThrottleLimit);
+
+        // Listener: edit the first listener if it exists, else create one.
+        // Any additional listeners after [0] are preserved untouched.
+        YamlSequenceNode listeners;
+        if (root.Children.TryGetValue(new YamlScalarNode("listeners"), out var listenersNode) &&
+            listenersNode is YamlSequenceNode existingListeners)
+        {
+            listeners = existingListeners;
+        }
+        else
+        {
+            listeners = new YamlSequenceNode();
+            root.Children[new YamlScalarNode("listeners")] = listeners;
+        }
+        YamlMappingNode firstListener;
+        if (listeners.Children.Count > 0 && listeners.Children[0] is YamlMappingNode existingFirst)
+        {
+            firstListener = existingFirst;
+        }
+        else
+        {
+            firstListener = new YamlMappingNode();
+            listeners.Children.Insert(0, firstListener);
+        }
+        SetScalar(firstListener, "host", config.Host);
+        SetScalar(firstListener, "motd", config.Motd);
+        SetScalar(firstListener, "max_players", config.MaxPlayers);
+        SetScalar(firstListener, "query_enabled", config.QueryEnabled);
+        SetScalar(firstListener, "query_port", config.QueryPort);
+        SetScalar(firstListener, "ping_passthrough", config.PingPassthrough);
+        SetScalar(firstListener, "force_default_server", config.ForceDefaultServer);
+        SetScalar(firstListener, "tab_list", config.TabList);
+        SetScalar(firstListener, "proxy_protocol", config.ProxyProtocol);
+
+        // The collections are non-nullable on the record, but this DTO is bound
+        // straight from a PUT body and System.Text.Json leaves them null when the
+        // client omits the property — nullable reference types are not enforced at
+        // runtime. A null here means "the client said nothing about this key", which
+        // must leave whatever is already in the file alone. Writing an empty node
+        // instead would silently wipe the backend map on any partial PUT.
+        if (config.Priorities is not null)
+        {
+            var prioritiesSeq = new YamlSequenceNode();
+            foreach (var p in config.Priorities)
+            {
+                prioritiesSeq.Children.Add(new YamlScalarNode(p));
+            }
+            firstListener.Children[new YamlScalarNode("priorities")] = prioritiesSeq;
+        }
+
+        if (config.ForcedHosts is not null)
+        {
+            var forcedHostsMap = new YamlMappingNode();
+            foreach (var (host, target) in config.ForcedHosts)
+            {
+                forcedHostsMap.Children[new YamlScalarNode(host)] = new YamlScalarNode(target ?? string.Empty);
+            }
+            firstListener.Children[new YamlScalarNode("forced_hosts")] = forcedHostsMap;
+        }
+
+        if (config.Servers is not null)
+        {
+            var serversMap = new YamlMappingNode();
+            foreach (var (key, backend) in config.Servers)
+            {
+                var entry = new YamlMappingNode
+                {
+                    { new YamlScalarNode("address"), new YamlScalarNode(backend?.Address ?? string.Empty) },
+                    { new YamlScalarNode("motd"), new YamlScalarNode(backend?.Motd ?? string.Empty) },
+                    { new YamlScalarNode("restricted"), new YamlScalarNode(backend?.Restricted == true ? "true" : "false") }
+                };
+                serversMap.Children[new YamlScalarNode(key)] = entry;
+            }
+            root.Children[new YamlScalarNode("servers")] = serversMap;
+        }
+
+        var writer = new StringWriter();
+        new YamlStream(new YamlDocument(root)).Save(writer, assignAnchors: false);
+        return writer.ToString();
+    }
+
+    /// <summary>
+    /// BungeeCord's own config.yml defaults, with one deliberate divergence noted inline.
+    /// </summary>
+    public static BungeeConfigDto BungeeConfigDefaults(bool exists)
+    {
+        return new BungeeConfigDto(
+            Exists: exists,
+            OnlineMode: true,
+            IpForward: false,
+            PlayerLimit: -1,
+            Timeout: 30000,
+            NetworkCompressionThreshold: 256,
+            ForgeSupport: false,
+            LogCommands: false,
+            // BungeeCord defaults log_pings to true. MineOS heartbeats SLP-ping
+            // the proxy every few seconds for the dashboard, which floods the
+            // log. Default off here; users can re-enable in the Properties tab.
+            LogPings: false,
+            ConnectionThrottle: 4000,
+            ConnectionThrottleLimit: 3,
+            Host: "0.0.0.0:25577",
+            Motd: "&1Another BungeeCord server",
+            MaxPlayers: 1,
+            QueryEnabled: false,
+            QueryPort: 25577,
+            PingPassthrough: false,
+            ForceDefaultServer: false,
+            TabList: "GLOBAL_PING",
+            ProxyProtocol: false,
+            Priorities: new List<string>(),
+            ForcedHosts: new Dictionary<string, string>(),
+            Servers: new Dictionary<string, BungeeBackendDto>());
+    }
+
+    private static YamlMappingNode? GetFirstListener(YamlMappingNode root)
+    {
+        if (!root.Children.TryGetValue(new YamlScalarNode("listeners"), out var listenersNode) ||
+            listenersNode is not YamlSequenceNode listeners ||
+            listeners.Children.Count == 0)
+        {
+            return null;
+        }
+        return listeners.Children[0] as YamlMappingNode;
+    }
+
+    private static string YamlGetString(YamlMappingNode node, string key, string fallback)
+    {
+        if (node.Children.TryGetValue(new YamlScalarNode(key), out var v) &&
+            v is YamlScalarNode s &&
+            s.Value is not null)
+        {
+            return s.Value;
+        }
+        return fallback;
+    }
+
+    private static int YamlGetInt(YamlMappingNode node, string key, int fallback)
+    {
+        if (node.Children.TryGetValue(new YamlScalarNode(key), out var v) &&
+            v is YamlScalarNode s &&
+            int.TryParse(s.Value, out var parsed))
+        {
+            return parsed;
+        }
+        return fallback;
+    }
+
+    private static bool YamlGetBool(YamlMappingNode node, string key, bool fallback)
+    {
+        if (node.Children.TryGetValue(new YamlScalarNode(key), out var v) &&
+            v is YamlScalarNode s &&
+            bool.TryParse(s.Value, out var parsed))
+        {
+            return parsed;
+        }
+        return fallback;
+    }
+
+    private static void SetScalar(YamlMappingNode node, string key, string value)
+    {
+        node.Children[new YamlScalarNode(key)] = new YamlScalarNode(value ?? string.Empty);
+    }
+
+    private static void SetScalar(YamlMappingNode node, string key, int value)
+    {
+        node.Children[new YamlScalarNode(key)] = new YamlScalarNode(value.ToString());
+    }
+
+    private static void SetScalar(YamlMappingNode node, string key, bool value)
+    {
+        node.Children[new YamlScalarNode(key)] = new YamlScalarNode(value ? "true" : "false");
+    }
+
+    private static List<string> ReadPriorities(YamlMappingNode listener)
+    {
+        var result = new List<string>();
+        if (listener.Children.TryGetValue(new YamlScalarNode("priorities"), out var v) &&
+            v is YamlSequenceNode seq)
+        {
+            foreach (var item in seq.Children)
+            {
+                if (item is YamlScalarNode s && s.Value is not null)
+                {
+                    result.Add(s.Value);
+                }
+            }
+        }
+        return result;
+    }
+
+    private static Dictionary<string, string> ReadBungeeForcedHosts(YamlMappingNode listener)
+    {
+        var result = new Dictionary<string, string>();
+        if (listener.Children.TryGetValue(new YamlScalarNode("forced_hosts"), out var v) &&
+            v is YamlMappingNode map)
+        {
+            foreach (var (key, value) in map.Children)
+            {
+                if (key is YamlScalarNode hostScalar &&
+                    hostScalar.Value is { } host &&
+                    value is YamlScalarNode targetScalar &&
+                    targetScalar.Value is { } target)
+                {
+                    result[host] = target;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static Dictionary<string, BungeeBackendDto> ReadBungeeServers(YamlMappingNode root)
+    {
+        var result = new Dictionary<string, BungeeBackendDto>();
+        if (!root.Children.TryGetValue(new YamlScalarNode("servers"), out var v) ||
+            v is not YamlMappingNode map)
+        {
+            return result;
+        }
+
+        foreach (var (key, value) in map.Children)
+        {
+            if (key is not YamlScalarNode keyScalar ||
+                keyScalar.Value is not { } name ||
+                value is not YamlMappingNode entry)
+            {
+                continue;
+            }
+            var address = YamlGetString(entry, "address", "");
+            var motd = YamlGetString(entry, "motd", "");
+            var restricted = YamlGetBool(entry, "restricted", false);
+            result[name] = new BungeeBackendDto(address, motd, restricted);
+        }
+        return result;
+    }
+
+    public async Task<ServerConfigDto> GetServerConfigAsync(string name, CancellationToken cancellationToken)
+    {
+        var configPath = GetConfigPath(name);
+        if (!File.Exists(configPath))
+        {
+            // Return defaults
+            return new ServerConfigDto(
+                new JavaConfigDto("", 4096, 4096, null, null, null),
+                new MinecraftConfigDto(null, false, false),
+                new OnRebootConfigDto(false),
+                new AutoRestartConfigDto(false, 3, 300, 30, true, true)
+            );
+        }
+
+        var content = await File.ReadAllTextAsync(configPath, cancellationToken);
+        var sections = IniParser.ParseWithSections(content);
+
+        var javaSection = sections.TryGetValue("java", out var javaSectionRaw)
+            ? javaSectionRaw
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var minecraftSection = sections.TryGetValue("minecraft", out var minecraftSectionRaw)
+            ? minecraftSectionRaw
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var onrebootSection = sections.TryGetValue("onreboot", out var onrebootSectionRaw)
+            ? onrebootSectionRaw
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var autorestartSection = sections.TryGetValue("autorestart", out var autorestartSectionRaw)
+            ? autorestartSectionRaw
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        var java = new JavaConfigDto(
+            javaSection.GetValueOrDefault("java_binary", ""),
+            int.TryParse(javaSection.GetValueOrDefault("java_xmx", "4096"), out var xmx) ? xmx : 4096,
+            int.TryParse(javaSection.GetValueOrDefault("java_xms", "4096"), out var xms) ? xms : 4096,
+            GetOptionalValue(javaSection, "java_tweaks"),
+            GetOptionalValue(javaSection, "jarfile"),
+            GetOptionalValue(javaSection, "jar_args")
+        );
+
+        var minecraft = new MinecraftConfigDto(
+            GetOptionalValue(minecraftSection, "profile"),
+            bool.TryParse(minecraftSection.GetValueOrDefault("unconventional", "false"), out var unconventional) && unconventional,
+            bool.TryParse(minecraftSection.GetValueOrDefault("lan_broadcast", "false"), out var lanBroadcast) && lanBroadcast
+        );
+
+        var onreboot = new OnRebootConfigDto(
+            bool.TryParse(onrebootSection.GetValueOrDefault("start", "false"), out var start) && start
+        );
+
+        var autorestart = new AutoRestartConfigDto(
+            bool.TryParse(autorestartSection.GetValueOrDefault("enabled", "false"), out var arEnabled) && arEnabled,
+            int.TryParse(autorestartSection.GetValueOrDefault("max_attempts", "3"), out var maxAttempts) ? maxAttempts : 3,
+            int.TryParse(autorestartSection.GetValueOrDefault("cooldown_seconds", "300"), out var cooldown) ? cooldown : 300,
+            int.TryParse(autorestartSection.GetValueOrDefault("attempt_reset_minutes", "30"), out var resetMins) ? resetMins : 30,
+            bool.TryParse(autorestartSection.GetValueOrDefault("notify_on_crash", "true"), out var notifyCrash) && notifyCrash,
+            bool.TryParse(autorestartSection.GetValueOrDefault("notify_on_restart", "true"), out var notifyRestart) && notifyRestart
+        );
+
+        // [monitoring] section
+        var monitoringSection = sections.GetValueOrDefault("monitoring", new Dictionary<string, string>());
+        // Default to false when section is missing — avoids log spam on existing
+        // Vanilla/Bedrock servers. Users who want TPS monitoring can enable it.
+        var tpsEnabled = monitoringSection.GetValueOrDefault("tps_enabled", "false")
+            .Equals("true", StringComparison.OrdinalIgnoreCase);
+        var tpsCommand = monitoringSection.GetValueOrDefault("tps_command", "");
+        var monitoring = new MonitoringConfigDto(
+            tpsEnabled,
+            string.IsNullOrWhiteSpace(tpsCommand) ? null : tpsCommand);
+
+        // [display] section — mutable user-facing label (issue #180).
+        var displaySection = sections.GetValueOrDefault("display", new Dictionary<string, string>());
+        var displayNameValue = GetOptionalValue(displaySection, "name");
+        var displayName = string.IsNullOrWhiteSpace(displayNameValue) ? null : displayNameValue!.Trim();
+
+        return new ServerConfigDto(java, minecraft, onreboot, autorestart, monitoring, displayName);
+    }
+
+    public async Task UpdateServerConfigAsync(string name, ServerConfigDto config, CancellationToken cancellationToken)
+    {
+        var existing = await GetServerConfigAsync(name, cancellationToken);
+        var sections = new Dictionary<string, Dictionary<string, string>>
+        {
+            ["java"] = new()
+            {
+                ["java_binary"] = config.Java.JavaBinary,
+                ["java_xmx"] = config.Java.JavaXmx.ToString(),
+                ["java_xms"] = config.Java.JavaXms.ToString(),
+                ["java_tweaks"] = config.Java.JavaTweaks ?? "",
+                ["jarfile"] = config.Java.JarFile ?? "",
+                ["jar_args"] = config.Java.JarArgs ?? ""
+            },
+            ["minecraft"] = new()
+            {
+                ["profile"] = config.Minecraft.Profile ?? "",
+                ["unconventional"] = config.Minecraft.Unconventional.ToString().ToLower(),
+                ["lan_broadcast"] = config.Minecraft.LanBroadcast.ToString().ToLower()
+            },
+            ["onreboot"] = new()
+            {
+                ["start"] = config.OnReboot.Start.ToString().ToLower()
+            },
+            ["autorestart"] = new()
+            {
+                ["enabled"] = config.AutoRestart.Enabled.ToString().ToLower(),
+                ["max_attempts"] = config.AutoRestart.MaxAttempts.ToString(),
+                ["cooldown_seconds"] = config.AutoRestart.CooldownSeconds.ToString(),
+                ["attempt_reset_minutes"] = config.AutoRestart.AttemptResetMinutes.ToString(),
+                ["notify_on_crash"] = config.AutoRestart.NotifyOnCrash.ToString().ToLower(),
+                ["notify_on_restart"] = config.AutoRestart.NotifyOnRestart.ToString().ToLower()
+            },
+            ["monitoring"] = new Dictionary<string, string>
+            {
+                ["tps_enabled"] = (config.Monitoring?.TpsEnabled ?? false).ToString().ToLower(),
+                ["tps_command"] = config.Monitoring?.TpsCommand ?? ""
+            },
+            // Round-trips the display label so a config edit can't wipe it (issue #180).
+            ["display"] = new()
+            {
+                ["name"] = config.DisplayName ?? ""
+            }
+        };
+
+        // [updates] is owned by UpdateService and deliberately absent from the
+        // DTO; carry the raw section through so this full-replace write cannot
+        // silently wipe a server's update preferences.
+        var configPath = GetConfigPath(name);
+        if (File.Exists(configPath))
+        {
+            var rawSections = IniParser.ParseWithSections(await File.ReadAllTextAsync(configPath, cancellationToken));
+            if (rawSections.TryGetValue("updates", out var updatesSection))
+            {
+                sections["updates"] = updatesSection;
+            }
+        }
+
+        var content = IniParser.WriteWithSections(sections);
+        await File.WriteAllTextAsync(configPath, content, cancellationToken);
+        await OwnershipHelper.ChangeOwnershipAsync(configPath, _options.RunAsUid, _options.RunAsGid, _logger, cancellationToken);
+
+        var jarChanged = !string.Equals(existing.Java.JarFile ?? string.Empty, config.Java.JarFile ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        var profileChanged = !string.Equals(existing.Minecraft.Profile ?? string.Empty, config.Minecraft.Profile ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        if (jarChanged || profileChanged)
+        {
+            await MarkRestartRequiredAsync(name);
+        }
+
+        _logger.LogInformation("Updated server.config for {ServerName}", name);
+    }
+
+    public async Task SetDisplayNameAsync(string name, string? displayName, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        // Null/empty/whitespace clears the label; otherwise store it trimmed.
+        // Deliberately no running-state check: only server.config changes, and
+        // the JVM never reads it back (issue #180).
+        var trimmed = string.IsNullOrWhiteSpace(displayName) ? null : displayName!.Trim();
+        var config = await GetServerConfigAsync(name, cancellationToken);
+        await UpdateServerConfigAsync(name, config with { DisplayName = trimmed }, cancellationToken);
+
+        _logger.LogInformation("Set display name for {ServerName} to {DisplayName}", name, trimmed ?? "(cleared)");
+    }
+
+    public async Task AcceptEulaAsync(string name, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        var eulaPath = Path.Combine(serverPath, "eula.txt");
+        var lines = File.Exists(eulaPath)
+            ? new List<string>(await File.ReadAllLinesAsync(eulaPath, cancellationToken))
+            : new List<string>();
+
+        var updated = false;
+        for (var i = 0; i < lines.Count; i++)
+        {
+            if (lines[i].TrimStart().StartsWith("eula=", StringComparison.OrdinalIgnoreCase))
+            {
+                lines[i] = "eula=true";
+                updated = true;
+            }
+        }
+
+        if (!updated)
+        {
+            if (lines.Count == 0)
+            {
+                lines.Add("# Generated by MineOS");
+            }
+            lines.Add("eula=true");
+        }
+
+        await File.WriteAllLinesAsync(eulaPath, lines, cancellationToken);
+
+        // Change ownership so minecraft user can read the eula.txt file
+        await OwnershipHelper.ChangeOwnershipAsync(eulaPath, _options.RunAsUid, _options.RunAsGid, _logger, cancellationToken);
+
+        _logger.LogInformation("Accepted EULA for server {ServerName}", name);
+    }
+
+    public async Task RunFtbInstallerAsync(string name, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+        {
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+        }
+
+        if (await _processManager.IsServerRunningAsync(name, cancellationToken))
+        {
+            throw new InvalidOperationException($"Server '{name}' must be stopped before running the FTB installer");
+        }
+
+        var installerPath = Path.Combine(serverPath, "FTBInstall.sh");
+        if (!File.Exists(installerPath))
+        {
+            throw new FileNotFoundException($"FTBInstall.sh not found in server '{name}'");
+        }
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "sh",
+            Arguments = "FTBInstall.sh",
+            WorkingDirectory = serverPath,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var process = Process.Start(psi);
+        if (process == null)
+        {
+            throw new InvalidOperationException("Failed to start FTB installer");
+        }
+
+        await process.WaitForExitAsync(cancellationToken);
+
+        if (process.ExitCode != 0)
+        {
+            var error = await process.StandardError.ReadToEndAsync(cancellationToken);
+            throw new InvalidOperationException($"FTB installer failed: {error}");
+        }
+
+        _logger.LogInformation("FTB installer completed for server {ServerName}", name);
+    }
+
+    private static string? GetOptionalValue(IReadOnlyDictionary<string, string> section, string key)
+    {
+        return section.TryGetValue(key, out var value) ? value : null;
+    }
+
+    private static string ResolveJarPath(string serverPath, string jarFile)
+    {
+        var trimmed = jarFile.Trim();
+        if (Path.IsPathRooted(trimmed))
+        {
+            return trimmed;
+        }
+
+        return Path.Combine(serverPath, trimmed);
+    }
+
+    private static async Task EnsureEulaAcceptedAsync(string serverPath, CancellationToken cancellationToken)
+    {
+        var eulaPath = Path.Combine(serverPath, "eula.txt");
+        if (!File.Exists(eulaPath))
+        {
+            throw new InvalidOperationException("EULA has not been accepted yet. Call /servers/{name}/eula first.");
+        }
+
+        var lines = await File.ReadAllLinesAsync(eulaPath, cancellationToken);
+        var eulaLine = lines.FirstOrDefault(line => line.TrimStart().StartsWith("eula=", StringComparison.OrdinalIgnoreCase));
+        if (eulaLine == null || !eulaLine.Trim().Equals("eula=true", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("EULA has not been accepted yet. Call /servers/{name}/eula first.");
+        }
+    }
+
+    private static async Task<bool> IsEulaAcceptedAsync(string serverPath, CancellationToken cancellationToken)
+    {
+        var eulaPath = Path.Combine(serverPath, "eula.txt");
+        if (!File.Exists(eulaPath))
+        {
+            return false;
+        }
+
+        var lines = await File.ReadAllLinesAsync(eulaPath, cancellationToken);
+        var eulaLine = lines.FirstOrDefault(line => line.TrimStart().StartsWith("eula=", StringComparison.OrdinalIgnoreCase));
+        return eulaLine != null && eulaLine.Trim().Equals("eula=true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public Task MarkRestartRequiredAsync(string name, CancellationToken cancellationToken) =>
+        MarkRestartRequiredAsync(name);
+
+    private async Task MarkRestartRequiredAsync(string name)
+    {
+        var flagPath = GetRestartFlagPath(name);
+        try
+        {
+            await File.WriteAllTextAsync(flagPath, DateTimeOffset.UtcNow.ToString("O"));
+            OwnershipHelper.TrySetOwnership(flagPath, _options.RunAsUid, _options.RunAsGid, _logger);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to mark restart required for {ServerName}", name);
+        }
+    }
+
+    private void ClearRestartRequired(string name)
+    {
+        var flagPath = GetRestartFlagPath(name);
+        if (File.Exists(flagPath))
+        {
+            try
+            {
+                File.Delete(flagPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to clear restart flag for {ServerName}", name);
+            }
+        }
+    }
+
+    private async Task MarkStopRequestedAsync(string name)
+    {
+        var flagPath = GetStopRequestedFlagPath(name);
+        try
+        {
+            await File.WriteAllTextAsync(flagPath, DateTimeOffset.UtcNow.ToString("O"));
+            OwnershipHelper.TrySetOwnership(flagPath, _options.RunAsUid, _options.RunAsGid, _logger);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to mark stop requested for {ServerName}", name);
+        }
+    }
+
+    private void ClearStopRequested(string name)
+    {
+        var flagPath = GetStopRequestedFlagPath(name);
+        if (File.Exists(flagPath))
+        {
+            try
+            {
+                File.Delete(flagPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to clear stop requested flag for {ServerName}", name);
+            }
+        }
+    }
+
+    private async Task EnsureExecutableAvailableAsync(
+        string executable,
+        string args,
+        string friendlyName,
+        CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Checking {FriendlyName} availability via {Executable} {Args}", friendlyName, executable, args);
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = executable,
+                Arguments = args,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = new Process { StartInfo = startInfo };
+            process.Start();
+            await process.WaitForExitAsync(cancellationToken);
+
+            if (process.ExitCode != 0)
+            {
+                var error = await process.StandardError.ReadToEndAsync(cancellationToken);
+                _logger.LogWarning("{FriendlyName} check failed: exitCode={ExitCode} error={Error}", friendlyName, process.ExitCode, error);
+                throw new InvalidOperationException($"{friendlyName} check failed: {error}");
+            }
+        }
+        catch (System.ComponentModel.Win32Exception ex)
+        {
+            throw new InvalidOperationException($"{friendlyName} is not available on PATH.", ex);
+        }
+    }
+
+    private async Task VerifyServerStartedAsync(
+        string name,
+        string serverPath,
+        DateTimeOffset startTime,
+        string startupLogPath,
+        CancellationToken cancellationToken)
+    {
+        var logPath = Path.Combine(serverPath, "logs", "latest.log");
+        // BungeeCord logs to proxy.log.0 in the server root rather than
+        // logs/latest.log, so it never trips the latest.log check. Both are
+        // written by the server's own logger, which only runs once the process
+        // is genuinely up — unlike startup.log, which also captures JVM-level
+        // failure output (bad Java version, missing jar, unaccepted EULA) and
+        // so cannot distinguish a started server from a crashed one.
+        var logCandidates = new[]
+        {
+            logPath,
+            Path.Combine(serverPath, "proxy.log.0")
+        };
+        var timeout = TimeSpan.FromSeconds(10);
+        var started = DateTimeOffset.UtcNow;
+
+        while (DateTimeOffset.UtcNow - started < timeout)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var processInfo = _processManager.GetServerProcess(name);
+            if (processInfo?.ScreenPid != null || processInfo?.JavaPid != null)
+            {
+                _logger.LogInformation(
+                    "Detected running process for {ServerName}: screenPid={ScreenPid} javaPid={JavaPid}",
+                    name,
+                    processInfo?.ScreenPid,
+                    processInfo?.JavaPid);
+                return;
+            }
+
+            foreach (var candidate in logCandidates)
+            {
+                if (!File.Exists(candidate))
+                {
+                    continue;
+                }
+                var logInfo = new FileInfo(candidate);
+                if (logInfo.LastWriteTimeUtc >= startTime.UtcDateTime)
+                {
+                    _logger.LogInformation("Detected log output for {ServerName} at {LogPath}", name, candidate);
+                    return;
+                }
+            }
+
+            await Task.Delay(250, cancellationToken);
+        }
+
+        _logger.LogWarning("Start verification timed out for {ServerName}. Log exists: {HasLog}", name, File.Exists(logPath));
+        var latestLog = File.Exists(logPath) ? await ReadLogTailAsync(logPath, 20, cancellationToken) : "No latest.log output found.";
+        var startupLog = File.Exists(startupLogPath) ? await ReadLogTailAsync(startupLogPath, 40, cancellationToken) : "No startup.log output found.";
+        throw new InvalidOperationException($"Server '{name}' did not start. {latestLog} {startupLog}");
+    }
+
+    private static async Task<string> ReadLogTailAsync(string logPath, int maxLines, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var allLines = await File.ReadAllLinesAsync(logPath, cancellationToken);
+            var lines = allLines.TakeLast(maxLines).ToList();
+            return lines.Count > 0
+                ? $"Last log lines: {string.Join(" | ", lines)}"
+                : "Log file is empty.";
+        }
+        catch (Exception ex)
+        {
+            return $"Failed to read log output: {ex.Message}";
+        }
+    }
+
+    private static string EscapeBashArgument(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return "''";
+        }
+
+        return "'" + value.Replace("'", "'\"'\"'") + "'";
+    }
+
+    private async Task<HashSet<int>> GetUsedPortsAsync(string? excludeName, CancellationToken cancellationToken)
+    {
+        var usedPorts = new HashSet<int>();
+        var serversPath = Path.Combine(_options.BaseDirectory, _options.ServersPathSegment);
+        if (!Directory.Exists(serversPath))
+        {
+            return usedPorts;
+        }
+
+        foreach (var dir in Directory.EnumerateDirectories(serversPath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var serverName = Path.GetFileName(dir);
+            if (string.IsNullOrWhiteSpace(serverName))
+            {
+                continue;
+            }
+            if (!string.IsNullOrWhiteSpace(excludeName) &&
+                serverName.Equals(excludeName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var propertiesPath = Path.Combine(dir, "server.properties");
+            if (File.Exists(propertiesPath))
+            {
+                var content = await File.ReadAllTextAsync(propertiesPath, cancellationToken);
+                var props = IniParser.ParseSimple(content);
+                if (props.TryGetValue("server-port", out var portValue) &&
+                    int.TryParse(portValue, out var port))
+                {
+                    usedPorts.Add(port);
+                }
+                continue;
+            }
+
+            // Proxies have no server.properties — their port lives in velocity.toml's
+            // "bind". Count it so a second proxy doesn't default to the same port.
+            var tomlPath = Path.Combine(dir, "velocity.toml");
+            if (File.Exists(tomlPath))
+            {
+                try
+                {
+                    var toml = Toml.ToModel(await File.ReadAllTextAsync(tomlPath, cancellationToken));
+                    if (toml.TryGetValue("bind", out var bindObj) && bindObj is string bind)
+                    {
+                        var lastColon = bind.LastIndexOf(':');
+                        if (lastColon > 0 && lastColon < bind.Length - 1 &&
+                            int.TryParse(bind[(lastColon + 1)..], out var bindPort))
+                        {
+                            usedPorts.Add(bindPort);
+                        }
+                    }
+                }
+                catch
+                {
+                    // Malformed toml — skip; worst case the port is offered again.
+                }
+            }
+        }
+
+        return usedPorts;
+    }
+
+    private static int GetNextAvailablePort(HashSet<int> usedPorts, int startPort)
+    {
+        var port = startPort;
+        while (usedPorts.Contains(port))
+        {
+            port++;
+            if (port > 65535)
+            {
+                throw new InvalidOperationException("No available ports were found.");
+            }
+        }
+
+        return port;
+    }
+
+    private static string GetActiveWorldName(Dictionary<string, string> properties)
+    {
+        if (properties.TryGetValue("level-name", out var name) && !string.IsNullOrWhiteSpace(name))
+        {
+            return name.Trim();
+        }
+
+        return "world";
+    }
+
+    private static async Task CopyDirectoryAsync(
+        string sourcePath,
+        string targetPath,
+        CancellationToken cancellationToken,
+        HashSet<string> excludedDirectories)
+    {
+        foreach (var directory in Directory.GetDirectories(sourcePath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var directoryName = Path.GetFileName(directory);
+            if (directoryName != null && excludedDirectories.Contains(directoryName))
+            {
+                continue;
+            }
+
+            var targetDirectory = Path.Combine(targetPath, directoryName ?? string.Empty);
+            Directory.CreateDirectory(targetDirectory);
+            await CopyDirectoryAsync(directory, targetDirectory, cancellationToken, excludedDirectories);
+        }
+
+        foreach (var file in Directory.GetFiles(sourcePath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fileName = Path.GetFileName(file);
+            var targetFile = Path.Combine(targetPath, fileName);
+            await using var sourceStream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
+            await using var targetStream = new FileStream(targetFile, FileMode.Create, FileAccess.Write, FileShare.None, 4096, useAsync: true);
+            await sourceStream.CopyToAsync(targetStream, cancellationToken);
+        }
+    }
+
+    private static readonly HashSet<string> AllowedServerTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "java", "bedrock", "proxy", "vanilla", "paper", "spigot", "craftbukkit", "purpur",
+        "forge", "neoforge", "fabric", "quilt", "folia", "velocity", "bungeecord"
+    };
+
+    private static readonly HashSet<string> AllowedProxyKinds = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "velocity", "bungeecord"
+    };
+
+    /// <summary>
+    /// Normalizes a caller-supplied proxy implementation to a known kind. Null or
+    /// empty means "velocity" (the default proxy, and what pre-ProxyKind clients
+    /// send). Anything else is rejected rather than silently treated as BungeeCord.
+    /// </summary>
+    private static string NormalizeProxyKind(string? proxyKind)
+    {
+        if (string.IsNullOrWhiteSpace(proxyKind))
+            return "velocity";
+
+        if (!AllowedProxyKinds.Contains(proxyKind))
+            throw new ArgumentException($"Invalid proxy kind: '{proxyKind}'");
+
+        return proxyKind.ToLowerInvariant();
+    }
+
+    public async Task UpdateServerTypeAsync(string name, string serverType, string? proxyKind, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(serverType) || !AllowedServerTypes.Contains(serverType))
+            throw new ArgumentException($"Invalid server type: '{serverType}'");
+
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+
+        var normalized = serverType.ToLowerInvariant();
+
+        // "velocity" and "bungeecord" are accepted server types, but writing either
+        // verbatim to .mineos-server-type breaks every DetectServerType(name) ==
+        // "proxy" branch downstream (EULA skip, "end" vs "stop" on shutdown, which
+        // file the listen endpoint is read from). Normalize to "proxy" and let the
+        // value imply the proxy kind when the caller did not pass one.
+        string? requestedKind = proxyKind;
+        if (normalized is "velocity" or "bungeecord")
+        {
+            requestedKind ??= normalized;
+            normalized = "proxy";
+        }
+
+        // Validate before writing anything: an invalid kind must not leave a server
+        // marked "proxy" with no proxy config behind.
+        var kind = normalized == "proxy" ? NormalizeProxyKind(requestedKind) : null;
+
+        await File.WriteAllTextAsync(
+            Path.Combine(serverPath, ServerTypeFile), normalized, cancellationToken);
+
+        // When converting an existing server to a proxy, bootstrap the right
+        // config file (mirrors CreateServerAsync): pre-populated with sibling
+        // Java backends so a type-changed proxy is functional from first launch.
+        // proxyKind narrows to velocity (TOML) vs bungeecord (YAML).
+        if (normalized == "proxy")
+        {
+            // Neither proxy accepts `nogui`; flip unconventional so the launcher
+            // won't append it (wizard-created proxies already set this at creation).
+            var config = await GetServerConfigAsync(name, cancellationToken);
+            if (!config.Minecraft.Unconventional)
+            {
+                await UpdateServerConfigAsync(
+                    name,
+                    config with { Minecraft = config.Minecraft with { Unconventional = true } },
+                    cancellationToken);
+            }
+
+            if (kind == "velocity")
+            {
+                var tomlPath = GetVelocityTomlPath(name);
+                if (!File.Exists(tomlPath))
+                {
+                    // No backends by default — see CreateServerAsync for why.
+                    var initialConfig = VelocityConfigDefaults(exists: true) with
+                    {
+                        Servers = new Dictionary<string, string>(),
+                        Try = new List<string>()
+                    };
+                    await WriteVelocityTomlAsync(tomlPath, initialConfig, cancellationToken);
+                }
+            }
+            else
+            {
+                var yamlPath = GetBungeeConfigPath(name);
+                if (!File.Exists(yamlPath))
+                {
+                    // See CreateServerAsync — BungeeCord requires at least one
+                    // entry in servers: or it fails to start, so this placeholder is a
+                    // parser stub rather than a real backend.
+                    var bungeeBackends = new Dictionary<string, BungeeBackendDto>
+                    {
+                        ["lobby"] = new("127.0.0.1:25565", "&1Just another BungeeCord - Forced Host", false)
+                    };
+                    var initialConfig = BungeeConfigDefaults(exists: true) with
+                    {
+                        Servers = bungeeBackends,
+                        Priorities = new List<string> { bungeeBackends.Keys.First() }
+                    };
+                    await WriteBungeeConfigAsync(yamlPath, initialConfig, cancellationToken);
+                }
+            }
+        }
+
+        _logger.LogInformation("Updated server type for {Server} to {Type} (proxyKind={Kind})", name, normalized, proxyKind ?? "n/a");
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex[] JarLoaderPatterns =
+    [
+        new(@"^forge-(?<mc>[\d.]+)-", System.Text.RegularExpressions.RegexOptions.IgnoreCase),
+        new(@"^neoforge-(?<mc>[\d.]+)-", System.Text.RegularExpressions.RegexOptions.IgnoreCase),
+        new(@"^fabric-server-mc\.(?<mc>[\d.]+)-", System.Text.RegularExpressions.RegexOptions.IgnoreCase),
+        new(@"^fabric-loader-[\d.]+-(?<mc>[\d.]+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase),
+        new(@"^quilt-server-(?<mc>[\d.]+)-", System.Text.RegularExpressions.RegexOptions.IgnoreCase),
+    ];
+
+    private static readonly (string dir, string loader)[] LibraryDirLoaders =
+    [
+        // NeoForge before Forge so a NeoForge install is never reported as Forge.
+        ("net/neoforged", "neoforge"),
+        ("net/minecraftforge", "forge"),
+        ("net/fabricmc", "fabric"),
+    ];
+
+    /// <summary>
+    /// Best-effort extraction of the loader version from a configured jarfile value.
+    /// Handles both plain jars (e.g. "neoforge-21.1.227.jar") and @argfile paths
+    /// (e.g. "@libraries/net/neoforged/neoforge/21.1.227/unix_args.txt"). Returns null
+    /// when no version can be parsed — callers treat that as "unknown".
+    /// </summary>
+    private static string? ExtractLoaderVersion(string loader, string jarFile)
+    {
+        if (string.IsNullOrWhiteSpace(jarFile)) return null;
+
+        // For Forge/NeoForge the version follows the loader name as a path segment or
+        // "-version" suffix: ".../neoforge/21.1.227/..." or "neoforge-21.1.227.jar".
+        // For Fabric/Quilt the loader build follows "loader." in the jar name:
+        // "fabric-server-mc.1.21.1-loader.0.16.0.jar".
+        var pattern = loader switch
+        {
+            "neoforge" => @"neoforge[-/\\](?<v>\d[^/\\ ]*?)(?:\.jar|[/\\]|$)",
+            "forge" => @"(?<![a-z])forge[-/\\](?<v>\d[^/\\ ]*?)(?:\.jar|[/\\]|$)",
+            "fabric" or "quilt" => @"loader[.](?<v>\d[^/\\ ]*?)(?:\.jar|[/\\]|$)",
+            _ => null
+        };
+        if (pattern is null) return null;
+
+        var match = System.Text.RegularExpressions.Regex.Match(
+            jarFile, pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups["v"].Value : null;
+    }
+
+    /// <summary>
+    /// Extracts the Minecraft version a server jar targets.
+    ///
+    /// This is deliberately separate from <see cref="ExtractLoaderVersion"/>, which
+    /// reports the *loader's* version. For Fabric and Quilt the two differ
+    /// completely — "fabric-server-mc.1.21.1-loader.0.19.3.jar" is Minecraft 1.21.1
+    /// running loader 0.19.3 — and treating the loader version as the game version
+    /// made every Modrinth query filter on a game version that does not exist,
+    /// which returned zero mods for every Fabric server.
+    ///
+    /// Returns null when the jar name carries no usable version, so callers can
+    /// fall back to the configured profile rather than filtering on a wrong value.
+    /// </summary>
+    public static string? ParseMinecraftVersion(string? jarValue)
+    {
+        if (string.IsNullOrWhiteSpace(jarValue))
+        {
+            return null;
+        }
+
+        // Fabric and Quilt tag the game version explicitly, which is unambiguous.
+        var mcTagged = System.Text.RegularExpressions.Regex.Match(
+            jarValue, @"mc\.?(?<mc>\d+\.\d+(?:\.\d+)?)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (mcTagged.Success)
+        {
+            return mcTagged.Groups["mc"].Value;
+        }
+
+        // NeoForge names carry no Minecraft version at all: its own version encodes
+        // it, so 21.1.227 means Minecraft 1.21.1 and 21.0.x means 1.21.
+        var neoforge = System.Text.RegularExpressions.Regex.Match(
+            jarValue, @"neoforge[-/\\](?<major>\d+)\.(?<minor>\d+)\.\d+",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (neoforge.Success)
+        {
+            var major = neoforge.Groups["major"].Value;
+            var minor = neoforge.Groups["minor"].Value;
+            return minor == "0" ? $"1.{major}" : $"1.{major}.{minor}";
+        }
+
+        // Everything else (paper-1.21.11-132.jar, forge-1.20.1-47.2.0.jar,
+        // minecraft_server.1.20.1.jar) carries a literal 1.x[.y]; the leftmost
+        // match is the game version, later numbers are build or loader versions.
+        var literal = System.Text.RegularExpressions.Regex.Match(
+            jarValue, @"(?:^|[-_./\\])(?<mc>1\.\d+(?:\.\d+)?)(?:[-_./\\]|$)");
+        return literal.Success ? literal.Groups["mc"].Value : null;
+    }
+
+    public async Task<ServerLoaderDto> DetectLoaderAsync(string name, CancellationToken cancellationToken)
+    {
+        var serverPath = GetServerPath(name);
+        if (!Directory.Exists(serverPath))
+            throw new DirectoryNotFoundException($"Server '{name}' not found");
+
+        var config = await GetServerConfigAsync(name, cancellationToken);
+        var jarFile = config.Java.JarFile ?? "";
+        var jarArgs = config.Java.JarArgs ?? "";
+        var javaTweaks = config.Java.JavaTweaks ?? "";
+        var profile = config.Minecraft.Profile ?? "";
+
+        // Priority 2: detect from the configured jar value. We inspect the FULL value
+        // (not just the file name) because modern Forge/NeoForge use an @argfile that
+        // points at libraries/net/<vendor>/<loader>/<version>/unix_args.txt — the loader
+        // and version live in the path, not the file name (which is just "unix_args.txt").
+        var jarLower = jarFile.ToLowerInvariant();
+        if (!string.IsNullOrWhiteSpace(jarLower))
+        {
+            // NeoForge MUST be tested before Forge: "neoforge" contains the substring
+            // "forge", and NeoForge also uses the @argfile syntax — so an ordering/@-based
+            // check would otherwise mislabel NeoForge servers as Forge.
+            if (jarLower.Contains("neoforge") || jarLower.Contains("neoforged"))
+                return new ServerLoaderDto("neoforge", ExtractLoaderVersion("neoforge", jarFile), ParseMinecraftVersion(jarFile));
+            if (jarLower.Contains("minecraftforge") || jarLower.Contains("forge"))
+                return new ServerLoaderDto("forge", ExtractLoaderVersion("forge", jarFile), ParseMinecraftVersion(jarFile));
+            if (jarLower.Contains("fabric")) return new ServerLoaderDto("fabric", ExtractLoaderVersion("fabric", jarFile), ParseMinecraftVersion(jarFile));
+            if (jarLower.Contains("quilt")) return new ServerLoaderDto("quilt", ExtractLoaderVersion("quilt", jarFile), ParseMinecraftVersion(jarFile));
+            if (jarLower.Contains("paper")) return new ServerLoaderDto("paper", null, ParseMinecraftVersion(jarFile));
+            if (jarLower.Contains("spigot")) return new ServerLoaderDto("spigot", null, ParseMinecraftVersion(jarFile));
+            if (jarLower.Contains("purpur")) return new ServerLoaderDto("purpur", null, ParseMinecraftVersion(jarFile));
+            if (jarLower.Contains("bukkit")) return new ServerLoaderDto("bukkit", null, ParseMinecraftVersion(jarFile));
+        }
+
+        // Priority 3: bare @argfile with no loader hint in the path — legacy Forge modpacks
+        if (jarFile.TrimStart().StartsWith("@"))
+            return new ServerLoaderDto("forge", ExtractLoaderVersion("forge", jarFile));
+
+        // Priority 4: jar args and java tweaks containing loader names
+        var combinedArgs = (jarArgs + " " + javaTweaks).ToLowerInvariant();
+        if (combinedArgs.Contains("neoforge")) return new ServerLoaderDto("neoforge", null);
+        if (combinedArgs.Contains("minecraftforge") || combinedArgs.Contains("net/forge"))
+            return new ServerLoaderDto("forge", null);
+        if (combinedArgs.Contains("forge") && !combinedArgs.Contains("neoforge"))
+            return new ServerLoaderDto("forge", null);
+        if (combinedArgs.Contains("fabricmc") || combinedArgs.Contains("fabric"))
+            return new ServerLoaderDto("fabric", null);
+
+        // Priority 5: Check for mod loader libraries on disk
+        var libPath = Path.Combine(serverPath, "libraries");
+        if (Directory.Exists(libPath))
+        {
+            foreach (var (dir, loader) in LibraryDirLoaders)
+            {
+                if (Directory.Exists(Path.Combine(libPath, dir.Replace('/', Path.DirectorySeparatorChar))))
+                    return new ServerLoaderDto(loader, null);
+            }
+        }
+
+        // Priority 6: Check for mods folder (suggests a mod loader even if we can't tell which)
+        if (Directory.Exists(Path.Combine(serverPath, "mods")))
+        {
+            // Check if any forge/fabric config files exist
+            if (File.Exists(Path.Combine(serverPath, "config", "forge-client.toml")) ||
+                File.Exists(Path.Combine(serverPath, "config", "forge-common.toml")))
+                return new ServerLoaderDto("forge", null);
+        }
+
+        return new ServerLoaderDto(null, null);
+    }
+}

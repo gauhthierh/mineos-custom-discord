@@ -1,0 +1,632 @@
+package tui
+
+import (
+	"strings"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+// HandleKey processes key input in normal mode
+func (m TuiModel) HandleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// While the help overlay is open, any key closes it (except quit keys).
+	if m.ShowHelp {
+		switch msg.String() {
+		case "ctrl+c", "q":
+			m.Quitting = true
+			m.StopLogs()
+			return m, tea.Quit
+		}
+		m.ShowHelp = false
+		return m, nil
+	}
+	if msg.String() == "?" {
+		m.ShowHelp = true
+		return m, nil
+	}
+
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		m.Quitting = true
+		m.StopLogs()
+		return m, tea.Quit
+
+	case tea.KeyUp:
+		return m.navUp()
+
+	case tea.KeyDown:
+		return m.navDown()
+
+	case tea.KeyLeft:
+		return m.navLeft()
+
+	case tea.KeyRight:
+		return m.navRight()
+
+	case tea.KeyEnter:
+		return m.navSelect()
+
+	case tea.KeyEsc:
+		return m.navBack()
+
+	case tea.KeyPgUp:
+		return m.pageUp()
+
+	case tea.KeyPgDown:
+		return m.pageDown()
+	}
+
+	// Vim-style navigation
+	switch msg.String() {
+	case "q":
+		m.Quitting = true
+		m.StopLogs()
+		return m, tea.Quit
+	case "j":
+		return m.navDown()
+	case "k":
+		return m.navUp()
+	case "h":
+		return m.navLeft()
+	case "l":
+		return m.navRight()
+	case "p":
+		// Toggle pre-release updates in settings view
+		if m.CurrentView == ViewSettings && m.ConfigReady {
+			return m, m.ToggleEnvSettingCmd("MINEOS_CLI_PRERELEASE_UPDATES", m.Cfg.PreReleaseUpdates)
+		}
+	case "/":
+		// Enter search mode in logs views
+		if m.CurrentView == ViewServiceLogs {
+			m.Mode = ModeSearch
+			m.Input.SetValue(m.LogSearchQuery)
+			m.Input.Placeholder = "search logs..."
+			m.Input.Focus()
+			return m, textinput.Blink
+		}
+	case "n":
+		// Find next match in search mode
+		if m.CurrentView == ViewServiceLogs && m.LogSearchQuery != "" {
+			return m.findNextMatch(1)
+		}
+	case "N":
+		// Find previous match in search mode
+		if m.CurrentView == ViewServiceLogs && m.LogSearchQuery != "" {
+			return m.findNextMatch(-1)
+		}
+	case "G":
+		// Jump to bottom of logs (vim-style)
+		if m.CurrentView == ViewServiceLogs {
+			m.LogScroll = 0
+			return m, nil
+		}
+	case "g":
+		// Check for 'gg' to jump to top
+		// Note: This is a simplified version, proper implementation would need state tracking
+		if m.CurrentView == ViewServiceLogs {
+			m.LogScroll = len(m.Logs)
+			return m, nil
+		}
+	}
+
+	return m, nil
+}
+
+// navLeft handles left arrow - switches log source in service logs view
+func (m TuiModel) navLeft() (tea.Model, tea.Cmd) {
+	if m.CurrentView == ViewServiceLogs && len(m.ComposeServices) > 1 {
+		// Find current index and go to previous
+		sources := m.ComposeServices
+		for i, svc := range sources {
+			if svc == m.LogSource {
+				prevIdx := i - 1
+				if prevIdx < 0 {
+					prevIdx = len(sources) - 1
+				}
+				m.LogSource = sources[prevIdx]
+				m.Logs = nil
+				m.LogScroll = 0 // Reset scroll when switching sources
+				return m, m.StartLogStreamCmd()
+			}
+		}
+	}
+	return m, nil
+}
+
+// navRight handles right arrow - switches log source in service logs view
+func (m TuiModel) navRight() (tea.Model, tea.Cmd) {
+	if m.CurrentView == ViewServiceLogs && len(m.ComposeServices) > 1 {
+		// Find current index and go to next
+		sources := m.ComposeServices
+		for i, svc := range sources {
+			if svc == m.LogSource {
+				nextIdx := (i + 1) % len(sources)
+				m.LogSource = sources[nextIdx]
+				m.Logs = nil
+				m.LogScroll = 0 // Reset scroll when switching sources
+				return m, m.StartLogStreamCmd()
+			}
+		}
+	}
+	return m, nil
+}
+
+// navUp moves selection up in the navigation menu
+func (m TuiModel) navUp() (tea.Model, tea.Cmd) {
+	// In logs view, scroll up by 1 line
+	if m.CurrentView == ViewServiceLogs {
+		if m.LogScroll < len(m.Logs)-1 {
+			m.LogScroll++
+		}
+		return m, nil
+	}
+
+	// In servers view with server actions mode
+	if m.CurrentView == ViewServers && m.ServerActions {
+		if m.ActionIndex > 0 {
+			m.ActionIndex--
+		}
+		return m, nil
+	}
+
+	// In servers view, handle server selection
+	if m.CurrentView == ViewServers && len(m.Servers) > 0 && m.Selected > 0 {
+		m.Selected--
+		// Always show Minecraft logs for selected server
+		m.MinecraftSource = m.SelectedServer()
+		m.Logs = nil
+		return m, m.StartLogStreamCmd()
+	}
+
+	// Navigate the menu
+	newIndex := NextSelectableIndex(m.NavItems, m.NavIndex, -1)
+	if newIndex != m.NavIndex {
+		m.NavIndex = newIndex
+		m.adjustScroll()
+	}
+	return m, nil
+}
+
+// navDown moves selection down in the navigation menu
+func (m TuiModel) navDown() (tea.Model, tea.Cmd) {
+	// In logs view, scroll down by 1 line
+	if m.CurrentView == ViewServiceLogs {
+		if m.LogScroll > 0 {
+			m.LogScroll--
+		}
+		return m, nil
+	}
+
+	// In servers view with server actions mode
+	if m.CurrentView == ViewServers && m.ServerActions {
+		if m.ActionIndex < len(GetServerActions())-1 {
+			m.ActionIndex++
+		}
+		return m, nil
+	}
+
+	// In servers view, handle server selection
+	if m.CurrentView == ViewServers && len(m.Servers) > 0 && m.Selected < len(m.Servers)-1 {
+		m.Selected++
+		// Always show Minecraft logs for selected server
+		m.MinecraftSource = m.SelectedServer()
+		m.Logs = nil
+		return m, m.StartLogStreamCmd()
+	}
+
+	// Navigate the menu
+	newIndex := NextSelectableIndex(m.NavItems, m.NavIndex, 1)
+	if newIndex != m.NavIndex {
+		m.NavIndex = newIndex
+		m.adjustScroll()
+	}
+	return m, nil
+}
+
+// adjustScroll adjusts the scroll offset to keep selection visible
+func (m *TuiModel) adjustScroll() {
+	visibleItems := m.Height - 10 // Approximate visible items
+	if visibleItems < 5 {
+		visibleItems = 5
+	}
+
+	if m.NavIndex < m.NavScroll {
+		m.NavScroll = m.NavIndex
+	} else if m.NavIndex >= m.NavScroll+visibleItems {
+		m.NavScroll = m.NavIndex - visibleItems + 1
+	}
+}
+
+// navSelect handles Enter key - activates the selected menu item
+func (m TuiModel) navSelect() (tea.Model, tea.Cmd) {
+	// Handle server actions mode
+	if m.CurrentView == ViewServers && m.ServerActions {
+		return m.executeServerAction()
+	}
+
+	// In servers view without server actions, Enter selects a server and shows actions
+	if m.CurrentView == ViewServers && len(m.Servers) > 0 {
+		m.ServerActions = true
+		m.ActionIndex = 0
+		return m, tea.Batch(m.StartPerfStreamCmd(), m.LoadPerfHistoryCmd())
+	}
+
+	if m.NavIndex < 0 || m.NavIndex >= len(m.NavItems) {
+		return m, nil
+	}
+
+	item := m.NavItems[m.NavIndex]
+
+	switch item.ItemType {
+	case NavView:
+		m.PreviousView = m.CurrentView
+		m.CurrentView = item.View
+		// Reset server actions mode when switching views
+		m.ServerActions = false
+		m.ActionIndex = 0
+		m.stopPerfStream()
+
+		// Switch log type based on view
+		var cmd tea.Cmd
+		if item.View == ViewServers {
+			// Switch to Minecraft logs for selected server
+			m.LogType = LogTypeMinecraft
+			m.MinecraftSource = m.SelectedServer()
+			m.Logs = nil
+			cmd = m.StartLogStreamCmd()
+		} else if item.View == ViewServiceLogs {
+			// Switch to Docker logs
+			m.LogType = LogTypeDocker
+			m.Logs = nil
+			cmd = m.StartLogStreamCmd()
+		} else if item.View == ViewHealth {
+			// Fetch immediately; the health tick keeps it fresh afterwards.
+			cmd = m.LoadHealthDataCmd()
+		}
+		return m, cmd
+
+	case NavAction:
+		if item.Action == nil {
+			return m, nil
+		}
+
+		// Handle special actions
+		if item.Action.Console {
+			if m.SelectedServer() == "" {
+				m.ErrMsg = "Select a server first (go to Servers view)"
+				return m, nil
+			}
+			m.Mode = ModeCommand
+			m.Input.SetValue("")
+			m.Input.Focus()
+			return m, textinput.Blink
+		}
+
+		// Check if action requires confirmation
+		if item.Destructive {
+			m.ConfirmAction = item.Action
+			m.ConfirmMessage = "This action may cause data loss. Continue?"
+			m.Mode = ModeConfirm
+			return m, nil
+		}
+
+		// Execute the action
+		return m.executeNavAction(item)
+	}
+
+	return m, nil
+}
+
+// executeServerAction executes the selected server action
+func (m TuiModel) executeServerAction() (tea.Model, tea.Cmd) {
+	actions := GetServerActions()
+	if m.ActionIndex < 0 || m.ActionIndex >= len(actions) {
+		return m, nil
+	}
+
+	action := actions[m.ActionIndex]
+	serverName := m.SelectedServer()
+
+	// Handle back action
+	if action.Action == "back" {
+		m.ServerActions = false
+		m.ActionIndex = 0
+		m.stopPerfStream()
+		return m, nil
+	}
+
+	// Handle console command
+	if action.Action == "console" {
+		m.Mode = ModeCommand
+		m.Input.SetValue("")
+		m.Input.Focus()
+		return m, textinput.Blink
+	}
+
+	// Destructive server actions confirm first, then run in-process.
+	if action.Destructive {
+		m.ConfirmServerName = serverName
+		m.ConfirmServerAction = action.Action
+		m.ConfirmAction = nil
+		m.ConfirmMessage = "This action may cause data loss. Continue?"
+		m.Mode = ModeConfirm
+		return m, nil
+	}
+
+	// Server actions run in-process through the API — no subprocess, no
+	// output-view detour. The status line and server list reflect the result.
+	m.StatusMsg = action.Label + ": " + serverName + "..."
+	return m, m.ServerActionCmd(serverName, action.Action)
+}
+
+// navBack handles Esc key - goes back to previous view or exits
+func (m TuiModel) navBack() (tea.Model, tea.Cmd) {
+	// If in server actions mode, go back to server list
+	if m.CurrentView == ViewServers && m.ServerActions {
+		m.ServerActions = false
+		m.ActionIndex = 0
+		m.stopPerfStream()
+		return m, nil
+	}
+
+	// If in output view, go back to previous view
+	if m.CurrentView == ViewOutput {
+		m.CurrentView = m.PreviousView
+		return m, nil
+	}
+
+	// If we have a previous view, go back to it
+	if m.PreviousView != m.CurrentView {
+		m.CurrentView = m.PreviousView
+		return m, nil
+	}
+
+	return m, nil
+}
+
+// executeNavAction executes a navigation action and shows output
+func (m TuiModel) executeNavAction(item NavItem) (tea.Model, tea.Cmd) {
+	if item.Action == nil {
+		return m, nil
+	}
+
+	// Build the command args, substituting server name if needed
+	args := make([]string, len(item.Action.Args))
+	copy(args, item.Action.Args)
+
+	// For server actions, substitute the selected server
+	if len(args) >= 2 && args[0] == "servers" && args[1] == "" {
+		server := m.SelectedServer()
+		if server == "" {
+			m.ErrMsg = "No server selected. Go to Servers view first."
+			return m, nil
+		}
+		args[1] = server
+	}
+
+	// Switch to output view for all commands
+	m.PreviousView = m.CurrentView
+	m.CurrentView = ViewOutput
+	m.OutputTitle = item.Label
+	m.OutputLines = []string{"Executing " + item.Label + "..."}
+
+	// Execute via CLI subprocess
+	menuItem := MenuItem{
+		Label:       item.Label,
+		Args:        args,
+		Interactive: item.Action.Interactive,
+		Streaming:   item.Action.Streaming,
+	}
+	return m, m.ExecMenuItem(menuItem)
+}
+
+// HandleCommandInput handles input when in command mode
+func (m TuiModel) HandleCommandInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.Mode = ModeNormal
+		m.Input.Blur()
+		return m, nil
+	case tea.KeyEnter:
+		command := strings.TrimSpace(m.Input.Value())
+		m.Mode = ModeNormal
+		m.Input.Blur()
+		if command == "" {
+			return m, nil
+		}
+		return m, m.ConsoleCommandCmd(command)
+	}
+
+	var cmd tea.Cmd
+	m.Input, cmd = m.Input.Update(msg)
+	return m, cmd
+}
+
+// HandleInteractiveInput handles input when running an interactive command
+func (m TuiModel) HandleInteractiveInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		// Cancel the interactive command
+		if m.InteractiveStdin != nil {
+			m.InteractiveStdin.Close()
+		}
+		m.Mode = ModeNormal
+		m.InteractiveRunning = false
+		m.InteractiveStdin = nil
+		m.InteractiveOutput = nil
+		m.Input.Blur()
+		m.OutputLines = append(m.OutputLines, "", "Cancelled.")
+		return m, nil
+
+	case tea.KeyEnter:
+		// Send input to the command
+		input := m.Input.Value()
+		m.Input.SetValue("")
+		m.OutputLines = append(m.OutputLines, "> "+input)
+		return m, m.SendInteractiveInput(input)
+	}
+
+	// Update the text input
+	var cmd tea.Cmd
+	m.Input, cmd = m.Input.Update(msg)
+	return m, cmd
+}
+
+// HandleConfirmInput handles input when in confirm mode
+func (m TuiModel) HandleConfirmInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		return m.confirmCancel()
+	case tea.KeyEnter:
+		return m.confirmAccept()
+	}
+
+	switch msg.String() {
+	case "y", "Y":
+		return m.confirmAccept()
+	case "n", "N":
+		return m.confirmCancel()
+	}
+
+	return m, nil
+}
+
+// clearConfirm resets all pending-confirmation state.
+func (m *TuiModel) clearConfirm() {
+	m.Mode = ModeNormal
+	m.ConfirmAction = nil
+	m.ConfirmMessage = ""
+	m.ConfirmServerName = ""
+	m.ConfirmServerAction = ""
+}
+
+func (m TuiModel) confirmCancel() (tea.Model, tea.Cmd) {
+	m.clearConfirm()
+	return m, nil
+}
+
+// confirmAccept executes whichever pending action was confirmed: an
+// in-process server action, or a subprocess command shown in the output view.
+func (m TuiModel) confirmAccept() (tea.Model, tea.Cmd) {
+	if m.ConfirmServerAction != "" {
+		name, action := m.ConfirmServerName, m.ConfirmServerAction
+		m.clearConfirm()
+		m.StatusMsg = action + ": " + name + "..."
+		return m, m.ServerActionCmd(name, action)
+	}
+
+	if m.ConfirmAction != nil {
+		action := m.ConfirmAction
+		m.clearConfirm()
+
+		// Switch to output view for subprocess commands
+		m.PreviousView = m.CurrentView
+		m.CurrentView = ViewOutput
+		m.OutputTitle = action.Label
+		m.OutputLines = []string{"Executing " + action.Label + "..."}
+
+		return m, m.ExecMenuItem(*action)
+	}
+
+	m.clearConfirm()
+	return m, nil
+}
+
+// pageUp scrolls up by one page in logs view
+func (m TuiModel) pageUp() (tea.Model, tea.Cmd) {
+	if m.CurrentView == ViewServiceLogs {
+		pageSize := m.Height - 10 // Approximate visible log lines
+		if pageSize < 5 {
+			pageSize = 5
+		}
+		m.LogScroll += pageSize
+		if m.LogScroll > len(m.Logs) {
+			m.LogScroll = len(m.Logs)
+		}
+	}
+	return m, nil
+}
+
+// pageDown scrolls down by one page in logs view
+func (m TuiModel) pageDown() (tea.Model, tea.Cmd) {
+	if m.CurrentView == ViewServiceLogs {
+		pageSize := m.Height - 10 // Approximate visible log lines
+		if pageSize < 5 {
+			pageSize = 5
+		}
+		m.LogScroll -= pageSize
+		if m.LogScroll < 0 {
+			m.LogScroll = 0
+		}
+	}
+	return m, nil
+}
+
+// findNextMatch finds the next occurrence of the search query in logs
+func (m TuiModel) findNextMatch(direction int) (tea.Model, tea.Cmd) {
+	if m.LogSearchQuery == "" || len(m.Logs) == 0 {
+		return m, nil
+	}
+
+	query := strings.ToLower(m.LogSearchQuery)
+	startLine := len(m.Logs) - m.LogScroll - 1
+
+	// Search forward or backward
+	if direction > 0 {
+		// Search forward (older logs)
+		for i := startLine + 1; i < len(m.Logs); i++ {
+			if strings.Contains(strings.ToLower(m.Logs[i]), query) {
+				m.LogScroll = len(m.Logs) - i - 1
+				return m, nil
+			}
+		}
+		// Wrap around
+		for i := 0; i <= startLine; i++ {
+			if strings.Contains(strings.ToLower(m.Logs[i]), query) {
+				m.LogScroll = len(m.Logs) - i - 1
+				return m, nil
+			}
+		}
+	} else {
+		// Search backward (newer logs)
+		for i := startLine - 1; i >= 0; i-- {
+			if strings.Contains(strings.ToLower(m.Logs[i]), query) {
+				m.LogScroll = len(m.Logs) - i - 1
+				return m, nil
+			}
+		}
+		// Wrap around
+		for i := len(m.Logs) - 1; i >= startLine; i-- {
+			if strings.Contains(strings.ToLower(m.Logs[i]), query) {
+				m.LogScroll = len(m.Logs) - i - 1
+				return m, nil
+			}
+		}
+	}
+
+	return m, nil
+}
+
+// HandleSearchInput handles input when in search mode
+func (m TuiModel) HandleSearchInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.Mode = ModeNormal
+		m.Input.Blur()
+		return m, nil
+	case tea.KeyEnter:
+		query := strings.TrimSpace(m.Input.Value())
+		m.Mode = ModeNormal
+		m.Input.Blur()
+		m.LogSearchQuery = query
+		// Jump to first match
+		if query != "" {
+			return m.findNextMatch(1)
+		}
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.Input, cmd = m.Input.Update(msg)
+	return m, cmd
+}

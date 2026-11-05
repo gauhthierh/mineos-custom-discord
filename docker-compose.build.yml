@@ -1,0 +1,15 @@
+services:
+  api:
+    build:
+      context: ./apps
+      dockerfile: MineOS.Api/Dockerfile
+      args:
+        MINEOS_IMAGE_TAG: ${MINEOS_IMAGE_TAG:-latest}
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        PUBLIC_BUILD_ID: ${PUBLIC_BUILD_ID:-dev}
+        PUBLIC_MINECRAFT_HOST: ${PUBLIC_MINECRAFT_HOST:-}

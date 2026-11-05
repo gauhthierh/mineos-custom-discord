@@ -1,0 +1,806 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Mvc;
+using MineOS.Api.Authorization;
+using MineOS.Application;
+using MineOS.Application.Dtos;
+using MineOS.Application.Interfaces;
+using MineOS.Infrastructure.Services;
+
+namespace MineOS.Api.Endpoints;
+
+public static class ServerEndpoints
+{
+    public static RouteGroupBuilder MapServerEndpoints(this RouteGroupBuilder api)
+    {
+        var servers = api.MapGroup("/servers");
+        servers.AddEndpointFilter<ServerAccessFilter>();
+
+        // Server CRUD
+        servers.MapPost("/", async (
+            [FromBody] CreateServerRequest request,
+            IServerService serverService,
+            HttpContext context,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                if (!IsAdminOrApiKey(context))
+                {
+                    return Results.Forbid();
+                }
+
+                // TODO: Get username from JWT claims
+                var username = "admin";
+                var server = await serverService.CreateServerAsync(request, username, cancellationToken);
+                return Results.Created($"/api/servers/{server.Name}", server);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        servers.MapPost("/{name}/clone", async (
+            string name,
+            [FromBody] CloneServerRequest request,
+            IServerService serverService,
+            HttpContext context,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                if (!IsAdminOrApiKey(context))
+                {
+                    return Results.Forbid();
+                }
+
+                if (string.IsNullOrWhiteSpace(request.NewName))
+                {
+                    return Results.BadRequest(new { error = "New server name is required." });
+                }
+
+                var server = await serverService.CloneServerAsync(name, request.NewName.Trim(), cancellationToken);
+                return Results.Ok(server);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        servers.MapGet("/list", async (
+            IServerService serverService,
+            IServerAccessService serverAccessService,
+            ClaimsPrincipal user,
+            CancellationToken cancellationToken) =>
+        {
+            var serverList = await serverService.ListServersAsync(cancellationToken);
+            if (user?.Identity?.IsAuthenticated != true)
+            {
+                return Results.Ok(serverList);
+            }
+
+            var role = user.FindFirstValue(ClaimTypes.Role) ?? "user";
+            if (string.Equals(role, "admin", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.Ok(serverList);
+            }
+
+            if (!TryGetUserId(user, out var userId))
+            {
+                return Results.Unauthorized();
+            }
+
+            var allowedServerNames = await serverAccessService.ListServerNamesAsync(userId, cancellationToken);
+            var allowedSet = new HashSet<string>(allowedServerNames, StringComparer.OrdinalIgnoreCase);
+            var filtered = serverList.Where(server => allowedSet.Contains(server.Name)).ToList();
+            return Results.Ok(filtered);
+        });
+
+        servers.MapGet("/{name}", async (
+            string name,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                var server = await serverService.GetServerAsync(name, cancellationToken);
+                return Results.Ok(server);
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        servers.MapDelete("/{name}", async (
+            string name,
+            IServerService serverService,
+            HttpContext context,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                if (!IsAdminOrApiKey(context))
+                {
+                    return Results.Forbid();
+                }
+
+                await serverService.DeleteServerAsync(name, cancellationToken);
+                return Results.NoContent();
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        // Mutable display label (issue #180). The on-disk name never changes,
+        // so this is allowed while the server is running. Rides the /servers
+        // group's ServerAccessFilter like every other server-scoped route.
+        servers.MapPut("/{name}/display-name", async (
+            string name,
+            [FromBody] SetDisplayNameRequest request,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            var displayName = request.DisplayName?.Trim();
+            if (displayName is { Length: > 64 })
+            {
+                return Results.BadRequest(new { error = "Display name must be 64 characters or fewer." });
+            }
+
+            if (displayName is not null && displayName.Any(char.IsControl))
+            {
+                return Results.BadRequest(new { error = "Display name cannot contain control characters." });
+            }
+
+            try
+            {
+                await serverService.SetDisplayNameAsync(
+                    name, string.IsNullOrEmpty(displayName) ? null : displayName, cancellationToken);
+                return Results.NoContent();
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        // Server status
+        servers.MapGet("/{name}/status", async (
+            string name,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                var heartbeat = await serverService.GetServerStatusAsync(name, cancellationToken);
+                return Results.Ok(heartbeat);
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        // Server software updates (issue #83): detection, per-server
+        // notification mode, and apply. Rides the group-level
+        // ServerAccessFilter like every other server-scoped route.
+        servers.MapGet("/{name}/updates", async (
+            string name,
+            IUpdateService updateService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                return Results.Ok(await updateService.GetUpdateStatusAsync(name, cancellationToken));
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        servers.MapPut("/{name}/updates/mode", async (
+            string name,
+            [FromBody] SetUpdateModeRequest request,
+            IUpdateService updateService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                await updateService.SetUpdateModeAsync(name, request.Mode ?? "", cancellationToken);
+                return Results.NoContent();
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        servers.MapPost("/{name}/updates/apply", async (
+            string name,
+            [FromBody] ApplyUpdateRequest request,
+            IUpdateService updateService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                var result = await updateService.ApplyUpdateAsync(name, request.ProfileId ?? "", cancellationToken);
+                return Results.Ok(result);
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        // Server actions
+        servers.MapPost("/actions/stop-all", async (
+            HttpContext context,
+            IServerService serverService,
+            ISettingsService settingsService,
+            [FromQuery] int? timeoutSeconds,
+            CancellationToken cancellationToken) =>
+        {
+            if (!IsAdminOrApiKey(context))
+            {
+                return Results.Forbid();
+            }
+
+            var timeout = await ResolveShutdownTimeoutAsync(settingsService, timeoutSeconds, cancellationToken);
+
+            var serversList = await serverService.ListServersAsync(cancellationToken);
+            var runningServers = serversList
+                .Where(server => string.Equals(server.Status, "running", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var results = await Task.WhenAll(runningServers.Select(async server =>
+            {
+                try
+                {
+                    await serverService.StopServerAsync(server.Name, timeout, cancellationToken);
+                    return new { name = server.Name, status = "stopped", error = (string?)null };
+                }
+                catch (TimeoutException ex)
+                {
+                    return new { name = server.Name, status = "timeout", error = ex.Message };
+                }
+                catch (Exception ex)
+                {
+                    return new { name = server.Name, status = "error", error = ex.Message };
+                }
+            }));
+
+            var stoppedCount = results.Count(result =>
+                string.Equals(result.status, "stopped", StringComparison.OrdinalIgnoreCase));
+
+            return Results.Ok(new
+            {
+                total = serversList.Count,
+                running = runningServers.Count,
+                stopped = stoppedCount,
+                skipped = serversList.Count - runningServers.Count,
+                results
+            });
+        });
+
+        servers.MapPost("/{name}/actions/{action}", async (
+            string name,
+            string action,
+            IServerService serverService,
+            ISettingsService settingsService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                switch (action.ToLower())
+                {
+                    case "start":
+                        await serverService.StartServerAsync(name, cancellationToken);
+                        return Results.Ok(new { message = $"Server '{name}' started" });
+
+                    case "stop":
+                        var timeout = await ResolveShutdownTimeoutAsync(settingsService, null, cancellationToken);
+                        await serverService.StopServerAsync(name, timeout, cancellationToken);
+                        return Results.Ok(new { message = $"Server '{name}' stopped" });
+
+                    // One gated operation, not a stop and a start with a gap between
+                    // them: another caller could win that gap, start the server, and
+                    // leave this restart failing with "already running".
+                    case "restart":
+                        var restartTimeout = await ResolveShutdownTimeoutAsync(settingsService, null, cancellationToken);
+                        await serverService.RestartServerAsync(name, restartTimeout, cancellationToken);
+                        return Results.Ok(new { message = $"Server '{name}' restarted" });
+
+                    case "kill":
+                        await serverService.KillServerAsync(name, cancellationToken);
+                        return Results.Ok(new { message = $"Server '{name}' killed" });
+
+                    default:
+                        return Results.BadRequest(new { error = $"Unknown action: {action}" });
+                }
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+            catch (TimeoutException)
+            {
+                return Results.StatusCode(408); // Request Timeout
+            }
+        });
+
+        // Server properties
+        servers.MapGet("/{name}/server-properties", async (
+            string name,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            var properties = await serverService.GetServerPropertiesAsync(name, cancellationToken);
+            return Results.Ok(properties);
+        });
+
+        servers.MapPut("/{name}/server-properties", async (
+            string name,
+            [FromBody] Dictionary<string, string> properties,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                await serverService.UpdateServerPropertiesAsync(name, properties, cancellationToken);
+                return Results.Ok(new { message = "Properties updated" });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        // Velocity (proxy) configuration
+        servers.MapGet("/{name}/velocity-config", async (
+            string name,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                var config = await serverService.GetVelocityConfigAsync(name, cancellationToken);
+                return Results.Ok(config);
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        servers.MapPut("/{name}/velocity-config", async (
+            string name,
+            [FromBody] VelocityConfigDto config,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                await serverService.UpdateVelocityConfigAsync(name, config, cancellationToken);
+                return Results.Ok(new { message = "Velocity config updated" });
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        // BungeeCord configuration (config.yml)
+        servers.MapGet("/{name}/bungee-config", async (
+            string name,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                var config = await serverService.GetBungeeConfigAsync(name, cancellationToken);
+                return Results.Ok(config);
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        servers.MapPut("/{name}/bungee-config", async (
+            string name,
+            [FromBody] BungeeConfigDto config,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                await serverService.UpdateBungeeConfigAsync(name, config, cancellationToken);
+                return Results.Ok(new { message = "BungeeCord config updated" });
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        // Proxy forwarding security. Both routes sit in the `servers` group, so
+        // ServerAccessFilter gates them against the server being acted on — the
+        // secure action deliberately targets the *backend*, which is the server
+        // whose files it changes.
+        servers.MapGet("/{name}/forwarding", async (
+            string name,
+            IProxyForwardingService forwardingService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                return Results.Ok(await forwardingService.GetForwardingStatusAsync(name, cancellationToken));
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        servers.MapGet("/{name}/forwarding/backends", async (
+            string name,
+            HttpContext httpContext,
+            IProxyForwardingService forwardingService,
+            IServerAccessService accessService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                var summary = await forwardingService.GetProxyBackendsAsync(name, cancellationToken);
+
+                // ServerAccessFilter only guards the proxy named in the route. The
+                // rows describe *other* servers, and "this one is open to
+                // impersonation" is exactly the sort of thing a partially
+                // privileged user should not learn about a server they cannot see.
+                var user = httpContext.User;
+                var role = user.FindFirstValue(ClaimTypes.Role) ?? "user";
+                var isAdmin = string.Equals(role, "admin", StringComparison.OrdinalIgnoreCase);
+
+                if (user.Identity?.IsAuthenticated == true && !isAdmin)
+                {
+                    if (!ServerAccessFilter.TryGetUserId(user, out var userId))
+                    {
+                        return Results.Unauthorized();
+                    }
+
+                    var visible = new List<BackendForwardingDto>();
+                    foreach (var backend in summary.Backends)
+                    {
+                        var access = await accessService.GetAccessAsync(
+                            userId, backend.ServerName, cancellationToken);
+                        if (access != null)
+                        {
+                            visible.Add(backend);
+                        }
+                    }
+                    summary = summary with { Backends = visible };
+                }
+
+                return Results.Ok(summary);
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        servers.MapPost("/{name}/forwarding/secure", async (
+            string name,
+            IProxyForwardingService forwardingService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                return Results.Ok(await forwardingService.SecureBackendAsync(name, cancellationToken));
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Refusals are expected here (no proxy, several proxies, a loader
+                // with no verified path) and each carries a message worth showing.
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        servers.MapPost("/{name}/forwarding/install-mod", async (
+            string name,
+            IProxyForwardingService forwardingService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                return Results.Ok(await forwardingService.InstallForwardingModAsync(name, cancellationToken));
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Wrong loader, or no build matching this Minecraft version. Both
+                // carry a message the user needs to read.
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        // Server config
+        servers.MapGet("/{name}/server-config", async (
+            string name,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            var config = await serverService.GetServerConfigAsync(name, cancellationToken);
+            return Results.Ok(config);
+        });
+
+        servers.MapPut("/{name}/server-config", async (
+            string name,
+            [FromBody] ServerConfigDto config,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            await serverService.UpdateServerConfigAsync(name, config, cancellationToken);
+            return Results.Ok(new { message = "Config updated" });
+        });
+
+        servers.MapPost("/{name}/eula", async (
+            string name,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                await serverService.AcceptEulaAsync(name, cancellationToken);
+                return Results.Ok(new { message = $"EULA accepted for '{name}'" });
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        servers.MapPost("/{name}/ftb-install", async (
+            string name,
+            IServerService serverService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                await serverService.RunFtbInstallerAsync(name, cancellationToken);
+                return Results.Ok(new { message = $"FTB installer completed for '{name}'" });
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (FileNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.Conflict(new { error = ex.Message });
+            }
+        });
+
+        // Server icon upload
+        servers.MapPost("/{name}/icon", async (
+            string name,
+            HttpRequest request,
+            IFileService fileService,
+            IServerIconProcessor iconProcessor,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                var resizedImageData = await iconProcessor.CreatePngAsync(request.Body, cancellationToken);
+
+                // Save as server-icon.png in the server directory
+                await fileService.WriteFileBytesAsync(name, "/server-icon.png", resizedImageData, cancellationToken);
+                return Results.Ok(new { message = "Server icon uploaded successfully" });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        servers.MapGet("/{name}/icon", async (
+            string name,
+            IFileService fileService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                var iconData = await fileService.ReadFileBytesAsync(name, "/server-icon.png", cancellationToken);
+                return Results.File(iconData, "image/png");
+            }
+            catch (FileNotFoundException)
+            {
+                return Results.NotFound(new { error = "Server icon not found" });
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        servers.MapDelete("/{name}/icon", async (
+            string name,
+            IFileService fileService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                await fileService.DeleteFileAsync(name, "/server-icon.png", cancellationToken);
+                return Results.Ok(new { message = "Server icon deleted successfully" });
+            }
+            catch (FileNotFoundException)
+            {
+                return Results.NotFound(new { error = "Server icon not found" });
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        // Phase 2: Backup and archive endpoints
+        servers.MapBackupEndpoints();
+        servers.MapArchiveEndpoints();
+
+        // Phase 2b: Client package endpoints
+        servers.MapClientPackageEndpoints();
+
+        // Phase 3: Console and monitoring endpoints
+        servers.MapConsoleEndpoints();
+        servers.MapMonitoringEndpoints();
+        servers.MapWatchdogEndpoints();
+
+        // Phase 4: File management endpoints
+        servers.MapFileEndpoints();
+
+        // Phase 6: Mod management endpoints
+        servers.MapModEndpoints();
+
+        // Phase 6b: Plugin management endpoints
+        servers.MapPluginEndpoints();
+
+        // Phase 6c: Resource Pack management endpoints
+        servers.MapResourcePackEndpoints();
+
+        var cron = api.MapGroup("/servers/{name}/cron");
+        cron.AddEndpointFilter<ServerAccessFilter>();
+
+        cron.MapGet("/", async (string name, ICronService cronService, CancellationToken ct) =>
+            Results.Ok(await cronService.ListAsync(name, ct)));
+
+        cron.MapPost("/", async (string name, CreateCronRequest request, ICronService cronService, CancellationToken ct) =>
+        {
+            if (!CronActions.IsValid(request.Action))
+            {
+                return Results.BadRequest(new
+                {
+                    error = $"Unknown cron action '{request.Action}'. Valid actions: {string.Join(", ", CronActions.All)}"
+                });
+            }
+            var dto = await cronService.CreateAsync(name, request, ct);
+            return Results.Created($"/api/v1/servers/{name}/cron/{dto.Hash}", dto);
+        });
+
+        cron.MapPatch("/{hash}", async (string name, string hash, UpdateCronRequest request, ICronService cronService, CancellationToken ct) =>
+        {
+            var dto = await cronService.UpdateAsync(name, hash, request, ct);
+            return dto is null ? Results.NotFound() : Results.Ok(dto);
+        });
+
+        cron.MapDelete("/{hash}", async (string name, string hash, ICronService cronService, CancellationToken ct) =>
+        {
+            var deleted = await cronService.DeleteAsync(name, hash, ct);
+            return deleted ? Results.NoContent() : Results.NotFound();
+        });
+
+        var logs = api.MapGroup("/servers/{name}/logs");
+        logs.AddEndpointFilter<ServerAccessFilter>();
+        logs.MapGet("/", (string name) => Results.Ok(new { paths = Array.Empty<string>() }));
+        logs.MapGet("/head/{*path}", (string name, string path) => Results.Ok(new { payload = "" }));
+
+        return api;
+    }
+
+    private static bool IsAdminOrApiKey(HttpContext context)
+    {
+        // If authenticated via JWT, check for admin role
+        if (context.User?.Identity?.IsAuthenticated == true)
+        {
+            var role = context.User.FindFirstValue(ClaimTypes.Role) ?? "user";
+            return string.Equals(role, "admin", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // If not JWT-authenticated, only allow if an API key header is present
+        // (the ApiKeyMiddleware already validated it before we get here)
+        return context.Request.Headers.ContainsKey("X-Api-Key");
+    }
+
+    private static async Task<int> ResolveShutdownTimeoutAsync(
+        ISettingsService settingsService,
+        int? overrideSeconds,
+        CancellationToken cancellationToken)
+    {
+        const int defaultTimeout = 300;
+        if (overrideSeconds.HasValue && overrideSeconds.Value > 0)
+        {
+            return overrideSeconds.Value;
+        }
+
+        var configured = await settingsService.GetAsync(SettingsService.Keys.ShutdownTimeoutSeconds, cancellationToken);
+        if (int.TryParse(configured, out var parsed) && parsed > 0)
+        {
+            return parsed;
+        }
+
+        return defaultTimeout;
+    }
+
+    private static bool TryGetUserId(ClaimsPrincipal user, out int userId)
+    {
+        userId = 0;
+        var claim = user.Claims.FirstOrDefault(c => c.Type == ClaimTypes.NameIdentifier)?.Value
+            ?? user.Claims.FirstOrDefault(c => c.Type == JwtRegisteredClaimNames.Sub)?.Value;
+        return int.TryParse(claim, out userId);
+    }
+}

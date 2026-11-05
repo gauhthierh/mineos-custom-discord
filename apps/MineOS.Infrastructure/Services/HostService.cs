@@ -1,0 +1,592 @@
+using System.Globalization;
+using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using MineOS.Application.Dtos;
+using MineOS.Application.Interfaces;
+using MineOS.Application.Options;
+using MineOS.Infrastructure.Utilities;
+
+namespace MineOS.Infrastructure.Services;
+
+public sealed class HostService : IHostService
+{
+    private readonly HostOptions _options;
+    private readonly ILogger<HostService> _logger;
+    private readonly IProcessManager _processManager;
+    private readonly IMonitoringService _monitoringService;
+    private readonly IServerService _serverService;
+
+    public HostService(
+        IOptions<HostOptions> options,
+        ILogger<HostService> logger,
+        IProcessManager processManager,
+        IMonitoringService monitoringService,
+        IServerService serverService)
+    {
+        _options = options.Value;
+        _logger = logger;
+        _processManager = processManager;
+        _monitoringService = monitoringService;
+        _serverService = serverService;
+    }
+
+    public Task<HostMetricsDto> GetMetricsAsync(CancellationToken cancellationToken)
+    {
+        var uptimeSeconds = (long)(Environment.TickCount64 / 1000);
+        var freeMemBytes = TryReadMemAvailableBytes();
+        var loadAvg = TryReadLoadAverage();
+        var disk = ReadDiskMetrics(_options.BaseDirectory);
+
+        if (disk.total == 0)
+        {
+            _logger.LogWarning("Disk metrics unavailable for {BaseDirectory}", _options.BaseDirectory);
+        }
+
+        var metrics = new HostMetricsDto(
+            uptimeSeconds,
+            freeMemBytes,
+            loadAvg,
+            new DiskMetricsDto(disk.available, disk.free, disk.total));
+
+        return Task.FromResult(metrics);
+    }
+
+    public async IAsyncEnumerable<HostMetricsDto> StreamMetricsAsync(
+        TimeSpan interval,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            yield return await GetMetricsAsync(cancellationToken);
+            try
+            {
+                await Task.Delay(interval, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                yield break;
+            }
+        }
+    }
+
+    public async Task<IReadOnlyList<ServerSummaryDto>> GetServersAsync(CancellationToken cancellationToken)
+    {
+        var serversPath = Path.Combine(_options.BaseDirectory, _options.ServersPathSegment);
+        if (!Directory.Exists(serversPath))
+        {
+            return Array.Empty<ServerSummaryDto>();
+        }
+
+        var results = new List<ServerSummaryDto>();
+        foreach (var dir in Directory.EnumerateDirectories(serversPath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var name = Path.GetFileName(dir);
+            var props = TryReadProperties(Path.Combine(dir, "server.properties"));
+
+            // server.properties for java/bedrock; velocity.toml bind for proxies.
+            var endpoint = await _serverService.GetServerListenEndpointAsync(name, cancellationToken);
+            var port = endpoint?.Port;
+            var maxPlayers = props.TryGetValue("max-players", out var maxValue) && int.TryParse(maxValue, out var maxInt)
+                ? maxInt
+                : (int?)null;
+            var processInfo = _processManager.GetServerProcess(name);
+            var up = processInfo?.JavaPid != null || processInfo?.ScreenPid != null;
+            PingInfoDto? ping = null;
+            long? memoryBytes = null;
+            var needsRestart = File.Exists(Path.Combine(dir, ".mineos-restart-required"));
+
+            if (up)
+            {
+                var pingTask = _monitoringService.GetPingInfoAsync(name, cancellationToken);
+                var memoryTask = _monitoringService.GetMemoryInfoAsync(name, cancellationToken);
+
+                await Task.WhenAll(pingTask, memoryTask);
+                ping = await pingTask;
+                memoryBytes = memoryTask.Result.ResidentMemory;
+            }
+
+            var playersOnline = ping?.PlayersOnline;
+            var playersMax = ping?.PlayersMax ?? maxPlayers;
+
+            results.Add(new ServerSummaryDto(
+                Name: name,
+                Up: up,
+                Profile: null,
+                Port: port,
+                PlayersOnline: playersOnline,
+                PlayersMax: playersMax,
+                MemoryBytes: memoryBytes,
+                NeedsRestart: needsRestart,
+                DisplayName: TryReadDisplayName(dir)));
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Reads the mutable display label from a server directory's server.config
+    /// ([display] section, issue #180). Returns null when unset or unreadable —
+    /// callers fall back to the backend name.
+    /// </summary>
+    private static string? TryReadDisplayName(string serverDir)
+    {
+        try
+        {
+            var configPath = Path.Combine(serverDir, "server.config");
+            if (!File.Exists(configPath))
+            {
+                return null;
+            }
+
+            var sections = IniParser.ParseWithSections(File.ReadAllText(configPath));
+            if (!sections.TryGetValue("display", out var display) ||
+                !display.TryGetValue("name", out var value) ||
+                string.IsNullOrWhiteSpace(value))
+            {
+                return null;
+            }
+
+            return value.Trim();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    public Task<IReadOnlyList<ProfileDto>> GetProfilesAsync(CancellationToken cancellationToken)
+    {
+        var profilesPath = Path.Combine(_options.BaseDirectory, _options.ProfilesPathSegment);
+        if (!Directory.Exists(profilesPath))
+        {
+            return Task.FromResult<IReadOnlyList<ProfileDto>>(Array.Empty<ProfileDto>());
+        }
+
+        var results = new List<ProfileDto>();
+        foreach (var dir in Directory.EnumerateDirectories(profilesPath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var id = Path.GetFileName(dir);
+            var jar = Directory.EnumerateFiles(dir)
+                .FirstOrDefault(f => f.EndsWith(".jar", StringComparison.OrdinalIgnoreCase) ||
+                                     f.EndsWith(".phar", StringComparison.OrdinalIgnoreCase));
+
+            results.Add(new ProfileDto(
+                Id: id,
+                Group: "local",
+                Type: "unknown",
+                Version: string.Empty,
+                ReleaseTime: string.Empty,
+                Url: string.Empty,
+                Filename: jar != null ? Path.GetFileName(jar) : string.Empty,
+                Downloaded: jar != null,
+                Progress: null));
+        }
+
+        return Task.FromResult<IReadOnlyList<ProfileDto>>(results);
+    }
+
+    public Task<IReadOnlyList<ArchiveEntryDto>> GetImportsAsync(CancellationToken cancellationToken)
+    {
+        var importPath = Path.Combine(_options.BaseDirectory, _options.ImportPathSegment);
+        if (!Directory.Exists(importPath))
+        {
+            return Task.FromResult<IReadOnlyList<ArchiveEntryDto>>(Array.Empty<ArchiveEntryDto>());
+        }
+
+        var results = new List<ArchiveEntryDto>();
+        foreach (var file in Directory.EnumerateFiles(importPath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var info = new FileInfo(file);
+            results.Add(new ArchiveEntryDto(info.LastWriteTimeUtc, info.Length, info.Name));
+        }
+
+        return Task.FromResult<IReadOnlyList<ArchiveEntryDto>>(results);
+    }
+
+    public Task<IReadOnlyList<string>> GetLocalesAsync(CancellationToken cancellationToken)
+    {
+        if (!Directory.Exists(_options.LocalesPath))
+        {
+            return Task.FromResult<IReadOnlyList<string>>(new[] { "en_US" });
+        }
+
+        var locales = Directory.EnumerateFiles(_options.LocalesPath, "locale-*.json")
+            .Select(path => Path.GetFileName(path))
+            .Select(name => name.Replace("locale-", string.Empty, StringComparison.OrdinalIgnoreCase)
+                                .Replace(".json", string.Empty, StringComparison.OrdinalIgnoreCase))
+            .Where(locale => !string.IsNullOrWhiteSpace(locale))
+            .OrderBy(locale => locale)
+            .ToArray();
+
+        return Task.FromResult<IReadOnlyList<string>>(locales);
+    }
+
+    public Task<IReadOnlyList<HostUserDto>> GetUsersAsync(CancellationToken cancellationToken)
+    {
+        var passwdPath = "/etc/passwd";
+        if (!File.Exists(passwdPath))
+        {
+            return Task.FromResult<IReadOnlyList<HostUserDto>>(Array.Empty<HostUserDto>());
+        }
+
+        var results = new List<HostUserDto>();
+        foreach (var line in File.ReadLines(passwdPath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(line) || line.StartsWith('#'))
+            {
+                continue;
+            }
+
+            var parts = line.Split(':');
+            if (parts.Length < 7)
+            {
+                continue;
+            }
+
+            if (!int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var uid))
+            {
+                continue;
+            }
+
+            if (!int.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out var gid))
+            {
+                continue;
+            }
+
+            results.Add(new HostUserDto(parts[0], uid, gid, parts[5]));
+        }
+
+        return Task.FromResult<IReadOnlyList<HostUserDto>>(results);
+    }
+
+    public Task<IReadOnlyList<HostGroupDto>> GetGroupsAsync(CancellationToken cancellationToken)
+    {
+        var groupPath = "/etc/group";
+        if (!File.Exists(groupPath))
+        {
+            return Task.FromResult<IReadOnlyList<HostGroupDto>>(Array.Empty<HostGroupDto>());
+        }
+
+        var results = new List<HostGroupDto>();
+        foreach (var line in File.ReadLines(groupPath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(line) || line.StartsWith('#'))
+            {
+                continue;
+            }
+
+            var parts = line.Split(':');
+            if (parts.Length < 3)
+            {
+                continue;
+            }
+
+            if (!int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var gid))
+            {
+                continue;
+            }
+
+            results.Add(new HostGroupDto(parts[0], gid));
+        }
+
+        return Task.FromResult<IReadOnlyList<HostGroupDto>>(results);
+    }
+
+    private const string JvmRoot = "/usr/lib/jvm";
+
+    /// <summary>
+    /// Lists the Java runtimes installed on the host by scanning <c>/usr/lib/jvm</c>.
+    /// </summary>
+    /// <remarks>
+    /// The config UI used to offer a hardcoded list of paths, which drifted from what the
+    /// image actually ships - it named amd64 and JRE directories on an image carrying
+    /// arm64 JDKs, so every explicit choice pointed at a binary that did not exist, and
+    /// newly added runtimes never appeared. Reading the directory keeps the two in step.
+    /// </remarks>
+    public Task<IReadOnlyList<JavaRuntimeDto>> GetJavaRuntimesAsync(CancellationToken cancellationToken)
+    {
+        // Always offer the PATH default first: it is what an empty java_binary resolves
+        // through, and it is the only entry guaranteed to exist.
+        var runtimes = new List<JavaRuntimeDto>
+        {
+            new("java", null, string.Empty, "Default (java on PATH)", true)
+        };
+
+        if (!Directory.Exists(JvmRoot))
+        {
+            return Task.FromResult<IReadOnlyList<JavaRuntimeDto>>(runtimes);
+        }
+
+        var found = new List<JavaRuntimeDto>();
+        foreach (var home in Directory.EnumerateDirectories(JvmRoot))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var binary = Path.Combine(home, "bin", "java");
+            if (!File.Exists(binary))
+            {
+                continue;
+            }
+
+            var version = ReadJavaVersion(home);
+            var major = ParseJavaMajor(version) ?? ParseJavaMajor(Path.GetFileName(home));
+            var label = major is null
+                ? Path.GetFileName(home)
+                : $"Java {major}{(string.IsNullOrEmpty(version) ? string.Empty : $" ({version})")}";
+
+            found.Add(new JavaRuntimeDto(binary, major, version, label, false));
+        }
+
+        runtimes.AddRange(found
+            .OrderByDescending(runtime => runtime.Major ?? int.MinValue)
+            .ThenBy(runtime => runtime.Path, StringComparer.Ordinal));
+
+        return Task.FromResult<IReadOnlyList<JavaRuntimeDto>>(runtimes);
+    }
+
+    /// <summary>Reads JAVA_VERSION from a JDK/JRE's release file, e.g. "25.0.4".</summary>
+    private static string ReadJavaVersion(string javaHome)
+    {
+        var releasePath = Path.Combine(javaHome, "release");
+        if (!File.Exists(releasePath))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            foreach (var line in File.ReadLines(releasePath))
+            {
+                if (line.StartsWith("JAVA_VERSION=", StringComparison.Ordinal))
+                {
+                    return line["JAVA_VERSION=".Length..].Trim().Trim('"');
+                }
+            }
+        }
+        catch
+        {
+            // Unreadable release file: fall back to the directory name.
+        }
+
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Java major from a version or directory name. Handles the legacy "1.8.0_502" form,
+    /// where the major is the second component, as well as "25.0.4" and "temurin-21-jdk".
+    /// </summary>
+    public static int? ParseJavaMajor(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var match = System.Text.RegularExpressions.Regex.Match(value, @"(\d+)");
+        if (!match.Success || !int.TryParse(match.Groups[1].Value, out var first))
+        {
+            return null;
+        }
+
+        // "1.8.0_502" means Java 8; anything else already leads with its major.
+        if (first == 1)
+        {
+            var second = System.Text.RegularExpressions.Regex.Match(value, @"1\.(\d+)");
+            return second.Success && int.TryParse(second.Groups[1].Value, out var legacy) ? legacy : null;
+        }
+
+        return first;
+    }
+
+    private static Dictionary<string, string> TryReadProperties(string path)
+    {
+        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!File.Exists(path))
+        {
+            return dict;
+        }
+
+        foreach (var line in File.ReadLines(path))
+        {
+            if (string.IsNullOrWhiteSpace(line) || line.StartsWith('#'))
+            {
+                continue;
+            }
+
+            var idx = line.IndexOf('=');
+            if (idx <= 0)
+            {
+                continue;
+            }
+
+            var key = line.Substring(0, idx).Trim();
+            var value = line[(idx + 1)..].Trim();
+            dict[key] = value;
+        }
+
+        return dict;
+    }
+
+    private static (long available, long free, long total) ReadDiskMetrics(string path)
+    {
+        try
+        {
+            var root = ResolveDriveRoot(path);
+            if (string.IsNullOrWhiteSpace(root))
+            {
+                return (0, 0, 0);
+            }
+
+            var drive = new DriveInfo(root);
+            if (!drive.IsReady)
+            {
+                return (0, 0, 0);
+            }
+            return (drive.AvailableFreeSpace, drive.TotalFreeSpace, drive.TotalSize);
+        }
+        catch
+        {
+            return (0, 0, 0);
+        }
+    }
+
+    private static long TryReadMemAvailableBytes()
+    {
+        if (OperatingSystem.IsLinux())
+        {
+            return TryReadMemAvailableBytesLinux();
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            return TryReadMemAvailableBytesWindows();
+        }
+
+        var gcInfo = GC.GetGCMemoryInfo();
+        return gcInfo.TotalAvailableMemoryBytes > 0 ? gcInfo.TotalAvailableMemoryBytes : 0;
+    }
+
+    private static long TryReadMemAvailableBytesLinux()
+    {
+        const string meminfoPath = "/proc/meminfo";
+        if (!File.Exists(meminfoPath))
+        {
+            return 0;
+        }
+
+        foreach (var line in File.ReadLines(meminfoPath))
+        {
+            if (!line.StartsWith("MemAvailable:", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2)
+            {
+                return 0;
+            }
+
+            if (!long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var kb))
+            {
+                return 0;
+            }
+
+            return kb * 1024;
+        }
+
+        return 0;
+    }
+
+    private static double[] TryReadLoadAverage()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return new[] { 0d, 0d, 0d };
+        }
+
+        return TryReadLoadAverageLinux();
+    }
+
+    private static double[] TryReadLoadAverageLinux()
+    {
+        const string loadavgPath = "/proc/loadavg";
+        if (!File.Exists(loadavgPath))
+        {
+            return new[] { 0d, 0d, 0d };
+        }
+
+        var line = File.ReadLines(loadavgPath).FirstOrDefault();
+        if (line == null)
+        {
+            return new[] { 0d, 0d, 0d };
+        }
+
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3)
+        {
+            return new[] { 0d, 0d, 0d };
+        }
+
+        var values = new double[3];
+        for (var i = 0; i < 3; i++)
+        {
+            if (!double.TryParse(parts[i], NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            {
+                values[i] = 0d;
+            }
+            else
+            {
+                values[i] = value;
+            }
+        }
+
+        return values;
+    }
+
+    private static string? ResolveDriveRoot(string path)
+    {
+        var root = Path.GetPathRoot(path);
+        if (!string.IsNullOrWhiteSpace(root))
+        {
+            return root;
+        }
+
+        root = Path.GetPathRoot(Environment.SystemDirectory);
+        if (!string.IsNullOrWhiteSpace(root))
+        {
+            return root;
+        }
+
+        return Path.GetPathRoot(AppContext.BaseDirectory);
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct MemoryStatusEx
+    {
+        public uint dwLength;
+        public uint dwMemoryLoad;
+        public ulong ullTotalPhys;
+        public ulong ullAvailPhys;
+        public ulong ullTotalPageFile;
+        public ulong ullAvailPageFile;
+        public ulong ullTotalVirtual;
+        public ulong ullAvailVirtual;
+        public ulong ullAvailExtendedVirtual;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx buffer);
+
+    private static long TryReadMemAvailableBytesWindows()
+    {
+        var status = new MemoryStatusEx { dwLength = (uint)Marshal.SizeOf<MemoryStatusEx>() };
+        return GlobalMemoryStatusEx(ref status) ? (long)status.ullAvailPhys : 0;
+    }
+}
