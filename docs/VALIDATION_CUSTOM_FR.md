@@ -21,6 +21,15 @@ et le caractère aléatoire des identifiants sont conservés.
 - Vérification Svelte/TypeScript : aucune erreur, avertissements hérités inchangés.
 - Construction de l'interface de production réussie.
 - Ces parcours navigateur font désormais partie des contrôles avant publication.
+- Validation Linux complète et publication réussies :
+  https://github.com/gauhthierh/mineos-custom-discord/actions/runs/42034168388
+- Release : `custom-discord-2026.11.05-preview.5`, commit `7612134`.
+- Paquet public téléchargé, correctif présent et empreinte SHA-256 vérifiée :
+  `1969c524b1199f5b46bff9d460696e8ce76cd6ded654711f4ff69c3f894a85c6`.
+- La procédure de correction de l'interface seule a été vérifiée dans un dossier
+  jetable ; elle conserve les fichiers de données et les identifiants et ne demande
+  que la reconstruction et le redémarrage du service web.
+- Le correctif n'a pas été appliqué à distance au Debian du propriétaire.
 
 ## Révision avec fichiers standards (preview.3)
 
