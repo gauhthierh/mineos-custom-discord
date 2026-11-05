@@ -100,8 +100,8 @@ L'installateur en une commande et sa procédure de publication sont décrits dan
 [INSTALL_LINK_FR.md](INSTALL_LINK_FR.md). La procédure manuelle ci-dessous reste disponible.
 
 Cette procédure est préparée pour le déploiement ultérieur. Elle n'a pas encore
-été exécutée sur le Debian du propriétaire. La construction et l'exécution des
-conteneurs Linux restent à vérifier sur cette machine.
+été exécutée sur le Debian du propriétaire. La construction et le démarrage
+des conteneurs ont réussi sur le serveur Linux de validation GitHub.
 
 1. Installer Docker Engine et le plugin Compose selon la documentation officielle :
    https://docs.docker.com/engine/install/debian/

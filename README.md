@@ -1,6 +1,6 @@
 # MineOS - Minecraft Server Manager
 
-> **Version custom Discord en cours de préparation.** Elle ajoute des salons multiples,
+> **Version custom Discord.** Elle ajoute des salons multiples,
 > des règles par événement et serveur, des modèles de messages et un historique.
 > Voir [le guide custom](docs/CUSTOM_DISCORD_FR.md) et [l'installation par lien](docs/INSTALL_LINK_FR.md).
 > Les commandes `mineos.net` ci-dessous installent la version d'origine.
@@ -8,7 +8,8 @@
 ## Installation de notre préversion custom
 
 Dépôt : [gauhthierh/mineos-custom-discord](https://github.com/gauhthierh/mineos-custom-discord).
-Après publication d'une préversion validée, installer sur Debian 13 avec :
+La [préversion validée](https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.05-preview.2)
+est disponible. Installer sur Debian 13 avec :
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GauhthierH/mineos-custom-discord/vibing/scripts/install-custom.sh | bash -s -- --preview

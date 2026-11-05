@@ -8,9 +8,9 @@ Le lien télécharge notre script ; celui-ci récupère un paquet contenant nos
 sources modifiées, vérifie son empreinte SHA-256 et construit nos images Docker.
 Il n'utilise pas les images officielles, qui ne contiennent pas nos modifications.
 
-Le dépôt choisi est `GauhthierH/mineos-custom-discord`. Le script est prévu à une
-adresse fixe sur sa branche `vibing`. Ces commandes deviennent utilisables après
-publication du dépôt et de la release correspondante.
+Le dépôt est `GauhthierH/mineos-custom-discord`. La première préversion publiée
+est `custom-discord-2026.11.05-preview.2`. Le script est disponible à une adresse
+fixe sur sa branche `vibing`. Utiliser **--preview** pour cette première version.
 
 Après publication d'une première release stable custom, la commande sera :
 
@@ -92,8 +92,10 @@ personnel dans l'installateur ni d'en communiquer dans le chat.
 - Génération des identifiants sans écrasement d'un fichier existant.
 - Validation du fichier Docker Compose.
 
-L'installation complète sur Debian et l'exécution du workflow GitHub restent
-à réaliser. Le poste de développement ne dispose pas d'un moteur Docker Linux actif.
+Le workflow GitHub a réussi les tests, la construction des conteneurs et leur
+démarrage Linux : https://github.com/gauhthierh/mineos-custom-discord/actions/runs/42014516542
+Le téléchargement public et son empreinte ont été vérifiés après publication.
+L'installation complète sur le Debian 13 du propriétaire reste à réaliser.
 
 Sources :
 https://docs.github.com/en/rest/releases/releases

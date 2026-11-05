@@ -18,6 +18,13 @@ Date : 5 novembre 2026. Base d'origine : branche `vibing`, commit `12bbed1`.
 - Installateur par lien : aide, simulations stable/préversion/version précise,
   et refus des arguments invalides vérifiés.
 - Workflow de publication : YAML et syntaxe Bash de ses blocs vérifiés localement.
+- Validation GitHub sur Linux : suite .NET, interface, construction et démarrage
+  des conteneurs réussis. Exécution :
+  https://github.com/gauhthierh/mineos-custom-discord/actions/runs/42014516542
+- Préversion publiée :
+  https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.05-preview.2
+- Installateur et paquet source publics téléchargés et vérifiés après publication ;
+  empreinte SHA-256 correcte et aucune donnée locale dans l'archive.
 - Construction .NET de production : réussie, sans clé de licence de traitement d'images.
 - Audit NuGet de l'API, dépendances transitives comprises : aucun package vulnérable
   signalé par les sources consultées lors de cette validation.
@@ -54,12 +61,9 @@ Discord réel n'a été envoyé. Le test avec les vrais salons du propriétaire 
 
 ## Vérifications restant à effectuer avant déploiement
 
-- Construire et démarrer les conteneurs Linux : le moteur Docker Linux du poste
-  de développement n'est pas actif. Le workflow custom prévoit cette vérification
-  avant une publication, mais il n'a pas encore été exécuté sur GitHub.
 - Exécuter l'installation complète sur Debian 13 et vérifier la gestion d'un
   serveur Minecraft réel et de ses sauvegardes dans cet environnement.
 
 Le dépôt cible choisi par le propriétaire est `GauhthierH/mineos-custom-discord`.
-La publication d'une préversion est prévue après les contrôles du workflow Linux.
+La préversion a été publiée après réussite des contrôles du workflow Linux.
 L'installation sur le Debian du propriétaire n'a pas encore été effectuée.
