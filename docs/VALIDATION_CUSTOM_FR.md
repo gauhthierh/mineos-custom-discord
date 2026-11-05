@@ -16,6 +16,13 @@ Date : 5 novembre 2026. Base d'origine : branche `vibing`, commit `12bbed1`.
 - Vérification locale : 343 tests .NET, 139 tests unitaires de l'interface et
   deux parcours Chromium réussis. Vérification Svelte sans erreur ; les 93
   avertissements hérités restent inchangés. Construction de production réussie.
+- Validation Linux et publication réussies :
+  https://github.com/gauhthierh/mineos-custom-discord/actions/runs/42082833929
+- Release : `custom-discord-2026.11.05-preview.6`, commit `793b69e`.
+- Paquet public téléchargé, sources du pied de page vérifiées et SHA-256 contrôlé :
+  `98face0c1f4db469183973e9f8a15df7ecf91ad691d95c5b4fae8d7cffb8c303`.
+- Cette mise à jour de l'API et de l'interface reste à appliquer sur le Debian
+  du propriétaire. Aucun message Discord réel envoyé pendant ces vérifications.
 
 ## Correctif du bouton en HTTP (preview.5)
 
