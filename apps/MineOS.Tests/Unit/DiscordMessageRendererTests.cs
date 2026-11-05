@@ -37,6 +37,23 @@ public class DiscordMessageRendererTests
     }
 
     [Fact]
+    public void DefaultFooter_RemainsMineOSRegardlessOfSenderName()
+    {
+        using var document = JsonDocument.Parse(DiscordMessageRenderer.BuildPayload(Event(), username: "Noryandor"));
+        Assert.Equal("MineOS", document.RootElement.GetProperty("embeds")[0].GetProperty("footer").GetProperty("text").GetString());
+    }
+
+    [Fact]
+    public void CustomFooter_IsIncludedWithoutChangingTimestampOrMessage()
+    {
+        using var document = JsonDocument.Parse(DiscordMessageRenderer.BuildPayload(Event(), footerText: "Noryandor"));
+        var embed = document.RootElement.GetProperty("embeds")[0];
+        Assert.Equal("Noryandor", embed.GetProperty("footer").GetProperty("text").GetString());
+        Assert.Equal("Tout va bien.", embed.GetProperty("description").GetString());
+        Assert.True(embed.TryGetProperty("timestamp", out _));
+    }
+
+    [Fact]
     public void OversizedRuntimeMessages_AreTruncatedForDiscord()
     {
         var evt = Event() with { Title = new string('x', 1000), Message = new string('y', 10000), ServerName = new string('z', 2000) };

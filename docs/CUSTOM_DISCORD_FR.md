@@ -70,6 +70,23 @@ des salons permettent de vérifier chaque destination.
 Les mentions ne déclenchent pas de notifications de personnes, de rôles ou de
 `@everyone`. Les messages trop longs sont tronqués aux limites de Discord.
 
+### Texte en bas des cartes
+
+Dans la page **Discord**, le champ **Texte en bas des cartes** permet de remplacer
+le pied de page « MineOS » par le nom souhaité, par exemple **Noryandor**.
+Ce réglage s'applique à toutes les cartes et reste indépendant du nom de l'expéditeur.
+La valeur initiale reste **MineOS**, y compris pour les anciennes configurations.
+Un champ vide rétablit MineOS. La limite est de 80 caractères.
+
+Cliquer sur **Enregistrer** pour l'appliquer aux prochains envois et aux tests.
+**Voir l'aperçu** permet de vérifier une modification avant de l'enregistrer.
+Le réglage concerne les cartes Discord ; les messages au format texte simple
+ne possèdent pas de pied de page. Les messages déjà envoyés ne sont pas modifiés.
+
+Cette option est incluse à partir de `custom-discord-2026.11.05-preview.6`.
+Pour une installation existante, appliquer la procédure de mise à jour ci-dessous :
+cette évolution nécessite la reconstruction de l'API et de l'interface.
+
 ### Conservation et diagnostic
 
 Les réglages sont stockés dans la base MineOS. Les adresses de webhook ne sont
@@ -138,7 +155,7 @@ Prévoir une interruption et arrêter proprement les serveurs Minecraft avant de
 sauvegarder `data/`, `minecraft/` et le fichier de secrets.
 
 Télécharger le paquet `mineos-custom-source.tar.gz` et son `.sha256` depuis la
-[release preview.5](https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.05-preview.5).
+[release preview.6](https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.05-preview.6).
 Vérifier `sha256sum -c mineos-custom-source.tar.gz.sha256` dans le dossier de téléchargement,
 puis extraire le paquet dans le dossier de l'installation existante, sans déplacer
 `data/` ou `minecraft/`. Le paquet ne contient aucun fichier `.env`.
@@ -152,7 +169,7 @@ installation actuelle, après la sauvegarde décrite ci-dessus :
   install_dir="$PWD"
   [[ -f .env || -f .env.custom ]] || { echo 'Place-toi dans le dossier de MineOS.' >&2; exit 1; }
   download_dir=$(mktemp -d)
-  release_url=https://github.com/gauhthierh/mineos-custom-discord/releases/download/custom-discord-2026.11.05-preview.5
+  release_url=https://github.com/gauhthierh/mineos-custom-discord/releases/download/custom-discord-2026.11.05-preview.6
   curl -fsSL "$release_url/mineos-custom-source.tar.gz" -o "$download_dir/mineos-custom-source.tar.gz"
   curl -fsSL "$release_url/mineos-custom-source.tar.gz.sha256" -o "$download_dir/mineos-custom-source.tar.gz.sha256"
   (cd "$download_dir" && sha256sum -c mineos-custom-source.tar.gz.sha256)

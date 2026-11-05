@@ -22,6 +22,7 @@ export type DiscordRule = {
 export type DiscordConfiguration = {
 	enabled: boolean;
 	username: string;
+	footerText: string;
 	destinations: DiscordDestination[];
 	rules: DiscordRule[];
 };
@@ -47,7 +48,7 @@ export type DiscordJournal = {
 export type DiscordPreview = {
 	username: string;
 	content?: string;
-	embeds?: { title: string; description: string; color: number; timestamp?: string; fields?: { name: string; value: string }[] }[];
+	embeds?: { title: string; description: string; color: number; timestamp?: string; footer?: { text: string }; fields?: { name: string; value: string }[] }[];
 };
 
 /** randomUUID is unavailable on HTTP LAN addresses; getRandomValues still works there. */

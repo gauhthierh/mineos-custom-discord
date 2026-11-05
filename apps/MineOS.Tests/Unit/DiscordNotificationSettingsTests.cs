@@ -31,6 +31,44 @@ public class DiscordNotificationSettingsTests
     };
 
     [Fact]
+    public async Task CustomFooter_IsNormalizedAndPersistsWithoutExposingWebhooks()
+    {
+        var saved = await _service.SaveAsync(Configuration() with { FooterText = "  Noryandor  " }, default);
+        Assert.Equal("Noryandor", saved.FooterText);
+        var loaded = await _service.GetAsync(default);
+        Assert.Equal("Noryandor", loaded.FooterText);
+        Assert.Null(loaded.Destinations[0].WebhookUrl);
+        Assert.Equal(Webhook, (await _service.GetAsync(default, true)).Destinations[0].WebhookUrl);
+    }
+
+    [Fact]
+    public async Task ExistingConfigurationWithoutFooter_LoadsMineOS()
+    {
+        _values[DiscordNotificationSettings.SettingKey] = """{"enabled":false,"username":"Noryandor","destinations":[],"rules":[]}""";
+        Assert.Equal("MineOS", (await _service.GetAsync(default)).FooterText);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task EmptyFooter_RestoresMineOS(string? text)
+    {
+        await _service.SaveAsync(Configuration() with { FooterText = text! }, default);
+        Assert.Equal("MineOS", (await _service.GetAsync(default)).FooterText);
+    }
+
+    [Fact]
+    public async Task OversizedFooter_IsRejectedWithoutReplacingSettings()
+    {
+        await _service.SaveAsync(Configuration(), default);
+        var previous = _values[DiscordNotificationSettings.SettingKey];
+        await Assert.ThrowsAsync<ArgumentException>(() => _service.SaveAsync(
+            Configuration() with { FooterText = new string('x', 81) }, default));
+        Assert.Equal(previous, _values[DiscordNotificationSettings.SettingKey]);
+    }
+
+    [Fact]
     public async Task LegacyConfiguration_IsImportedWithoutExposingToken()
     {
         _values[SettingsService.Keys.DiscordWebhookUrl] = Webhook;

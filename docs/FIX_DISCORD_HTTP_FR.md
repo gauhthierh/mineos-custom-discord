@@ -5,6 +5,9 @@ En HTTP via une IP ou un nom réseau, le navigateur ne fournit pas `crypto.rando
 L'ajout des salons et des règles, ainsi que la duplication, utilisent désormais
 une méthode compatible HTTP qui conserve des identifiants UUID v4 aléatoires.
 
+Les versions 5 et suivantes incluent déjà ce correctif. Pour installer les nouveautés
+plus récentes, utiliser la [mise à jour complète](CUSTOM_DISCORD_FR.md#migration-des-premières-préversions).
+
 ## Appliquer le correctif à une installation avec les fichiers standards
 
 Depuis le dossier contenant `.env`, `docker-compose.yml` et `apps/`, copier ce bloc.

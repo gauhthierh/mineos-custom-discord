@@ -38,7 +38,7 @@ public class DiscordNotificationDeliveryTests
     public async Task StatusAndBackups_AreDeliveredToSeparateChannels()
     {
         var handler = new Handler();
-        using var provider = Build(DiscordNotificationSettingsTests.Configuration(), handler);
+        using var provider = Build(DiscordNotificationSettingsTests.Configuration() with { FooterText = "Noryandor" }, handler);
         var service = provider.GetRequiredService<DiscordWebhookService>();
         await service.StartAsync(default);
         try
@@ -53,6 +53,11 @@ public class DiscordNotificationDeliveryTests
             Assert.Contains("/123/", status.Url);
             Assert.Contains("/456/", backup.Url);
             Assert.Contains("Serveur", System.Text.Json.JsonDocument.Parse(status.Body).RootElement.GetProperty("embeds")[0].GetProperty("title").GetString());
+            foreach (var body in new[] { status.Body, backup.Body })
+            {
+                using var payload = System.Text.Json.JsonDocument.Parse(body);
+                Assert.Equal("Noryandor", payload.RootElement.GetProperty("embeds")[0].GetProperty("footer").GetProperty("text").GetString());
+            }
             Assert.Equal(2, handler.Count);
         }
         finally { await service.StopAsync(default); }
@@ -112,12 +117,13 @@ public class DiscordNotificationDeliveryTests
     public async Task ExplicitTest_CanRunWhileAutomaticDeliveryIsPaused()
     {
         var handler = new Handler();
-        using var provider = Build(DiscordNotificationSettingsTests.Configuration() with { Enabled = false }, handler);
+        using var provider = Build(DiscordNotificationSettingsTests.Configuration() with { Enabled = false, FooterText = "Noryandor" }, handler);
         var service = provider.GetRequiredService<DiscordWebhookService>();
         Assert.True((await service.TestAsync(new("backups", "backups", "backup.failed"), default)).Success);
         var (_, body) = await handler.Requests.Reader.ReadAsync();
         using var document = System.Text.Json.JsonDocument.Parse(body);
         Assert.Contains("Test de notification", document.RootElement.GetProperty("content").GetString());
+        Assert.Equal("Noryandor", document.RootElement.GetProperty("embeds")[0].GetProperty("footer").GetProperty("text").GetString());
     }
 
     [Fact]

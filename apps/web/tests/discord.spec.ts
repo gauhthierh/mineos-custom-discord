@@ -48,6 +48,7 @@ test(`Discord: route status and backups, ${overHttp ? 'HTTP LAN origin' : 'local
 		expect(await page.evaluate(() => typeof crypto.randomUUID)).toBe('undefined');
 	}
 	await expect(page.getByRole('heading', { name: 'Discord', exact: true })).toBeVisible();
+	await expect(page.getByLabel('Texte en bas des cartes')).toHaveValue('MineOS');
 	await page.getByRole('button', { name: '+ Ajouter un salon' }).click();
 	let destination = page.locator('.destination').nth(0);
 	await destination.getByLabel('Nom du salon').fill('statut');
@@ -73,11 +74,16 @@ test(`Discord: route status and backups, ${overHttp ? 'HTTP LAN origin' : 'local
 	const onlineRule = page.locator('.rule').nth(0);
 	await onlineRule.getByRole('button', { name: 'Voir l’aperçu' }).click();
 	await expect(onlineRule.locator('.embed')).toContainText('serveur-exemple est maintenant en ligne.');
+	await expect(onlineRule.locator('.embed small')).toContainText('MineOS');
+	await page.getByLabel('Texte en bas des cartes').fill('Noryandor');
+	await onlineRule.getByRole('button', { name: 'Voir l’aperçu' }).click();
+	await expect(onlineRule.locator('.embed small')).toContainText('Noryandor');
 	await page.getByRole('button', { name: 'Enregistrer', exact: true }).click();
 	await expect(page.getByRole('status')).toContainText('Réglages enregistrés.');
 	const response = await page.request.get('/api/discord/configuration');
 	const saved = await response.json();
 	expect(saved.enabled).toBe(false);
+	expect(saved.footerText).toBe('Noryandor');
 	expect(saved.rules).toHaveLength(3);
 	expect(saved.rules[0].destinationIds).toEqual([saved.destinations[0].id]);
 	expect(saved.rules[2].destinationIds).toEqual([saved.destinations[1].id]);
@@ -85,6 +91,7 @@ test(`Discord: route status and backups, ${overHttp ? 'HTTP LAN origin' : 'local
 	expect(JSON.stringify(saved)).not.toContain('fictitious-');
 	await page.reload();
 	await expect(page.locator('.rule')).toHaveCount(3);
+	await expect(page.getByLabel('Texte en bas des cartes')).toHaveValue('Noryandor');
 	await expect(page.locator('.destination').nth(0).getByLabel('URL du webhook')).toHaveValue('');
 	await expect(page.locator('.rule').nth(2).getByLabel('#sauvegardes', { exact: true })).toBeChecked();
 	await page.screenshot({ path: `test-results/discord-${overHttp ? 'http' : 'localhost'}-desktop.png`, fullPage: true });

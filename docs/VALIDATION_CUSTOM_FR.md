@@ -2,6 +2,21 @@
 
 Date : 5 novembre 2026. Base d'origine : branche `vibing`, commit `12bbed1`.
 
+## Pied de page personnalisable (preview.6)
+
+- Nouveau réglage global `footerText`, initialisé à MineOS pour les anciennes
+  configurations comme pour les nouvelles. Un champ vide rétablit MineOS.
+- Texte limité à 80 caractères, enregistré dans la configuration existante.
+- Valeur utilisée par les envois automatiques, les tests manuels et les aperçus.
+- L'aperçu du navigateur affiche le pied de page réellement calculé par l'API.
+- Tests ajoutés pour le réglage par défaut, l'enregistrement de Noryandor, les
+  anciennes configurations sans ce champ, la remise à zéro et le rejet des textes trop longs.
+- Les parcours navigateur vérifient MineOS par défaut, l'aperçu Noryandor,
+  l'enregistrement puis la conservation après rechargement, sur localhost et en HTTP.
+- Vérification locale : 343 tests .NET, 139 tests unitaires de l'interface et
+  deux parcours Chromium réussis. Vérification Svelte sans erreur ; les 93
+  avertissements hérités restent inchangés. Construction de production réussie.
+
 ## Correctif du bouton en HTTP (preview.5)
 
 Le défaut a été reproduit dans Chromium avec `isSecureContext === false` :

@@ -21,6 +21,7 @@ public sealed record DiscordNotificationConfiguration
 {
     public bool Enabled { get; init; } = true;
     public string Username { get; init; } = "MineOS";
+    public string FooterText { get; init; } = "MineOS";
     public List<DiscordDestination> Destinations { get; init; } = [];
     public List<DiscordNotificationRule> Rules { get; init; } = [];
 }
@@ -59,7 +60,8 @@ public sealed record DiscordTestRequest(string DestinationId, string? RuleId = n
     string EventType = "server.started", string ServerName = "serveur-exemple");
 public sealed record DiscordTestResult(bool Success, string Detail);
 public sealed record DiscordPreviewRequest(DiscordNotificationRule Rule,
-    string EventType = "server.started", string ServerName = "serveur-exemple", string Username = "MineOS");
+    string EventType = "server.started", string ServerName = "serveur-exemple", string Username = "MineOS",
+    string FooterText = "MineOS");
 
 public sealed record DiscordEventDefinition(string Id, string Category, string Label,
     string SampleTitle, string SampleMessage, DiscordEventLevel Level)

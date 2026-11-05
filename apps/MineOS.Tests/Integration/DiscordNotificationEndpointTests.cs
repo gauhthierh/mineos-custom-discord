@@ -53,12 +53,14 @@ public class DiscordNotificationEndpointTests : IClassFixture<MineOsWebApplicati
     public async Task SaveAndRead_RedactWebhookAndPreserveItOnUpdate()
     {
         using var client = AdminClient();
-        var response = await client.PutAsJsonAsync("/api/v1/discord/configuration", DiscordNotificationSettingsTests.Configuration());
+        var response = await client.PutAsJsonAsync("/api/v1/discord/configuration",
+            DiscordNotificationSettingsTests.Configuration() with { FooterText = "Noryandor" });
         response.EnsureSuccessStatusCode();
         var text = await response.Content.ReadAsStringAsync();
         Assert.DoesNotContain("secret-token", text);
         var saved = await response.Content.ReadFromJsonAsync<DiscordNotificationConfiguration>();
         Assert.True(saved!.Destinations[0].HasWebhook);
+        Assert.Equal("Noryandor", saved.FooterText);
         Assert.Null(saved.Destinations[0].WebhookUrl);
         saved.Rules[0] = saved.Rules[0] with { Enabled = false };
         (await client.PutAsJsonAsync("/api/v1/discord/configuration", saved)).EnsureSuccessStatusCode();
@@ -67,6 +69,7 @@ public class DiscordNotificationEndpointTests : IClassFixture<MineOsWebApplicati
         Assert.DoesNotContain("secret-token", await get.Content.ReadAsStringAsync());
         var loaded = await get.Content.ReadFromJsonAsync<DiscordNotificationConfiguration>();
         Assert.False(loaded!.Rules[0].Enabled);
+        Assert.Equal("Noryandor", loaded.FooterText);
         Assert.True(loaded.Destinations[0].HasWebhook);
     }
 
@@ -93,6 +96,19 @@ public class DiscordNotificationEndpointTests : IClassFixture<MineOsWebApplicati
         var json = await response.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal("Statut de survie\nEn ligne", json.GetProperty("content").GetString());
         Assert.Equal(0, json.GetProperty("allowed_mentions").GetProperty("parse").GetArrayLength());
+    }
+
+    [Fact]
+    public async Task Preview_UsesCustomFooterAndRejectsOversizedFooter()
+    {
+        using var client = AdminClient();
+        var request = new DiscordPreviewRequest(DiscordNotificationSettingsTests.Configuration().Rules[0], FooterText: "Noryandor");
+        var response = await client.PostAsJsonAsync("/api/v1/discord/preview", request);
+        response.EnsureSuccessStatusCode();
+        var payload = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("Noryandor", payload.GetProperty("embeds")[0].GetProperty("footer").GetProperty("text").GetString());
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.PostAsJsonAsync("/api/v1/discord/preview",
+            request with { FooterText = new string('x', 81) })).StatusCode);
     }
 
     [Fact]

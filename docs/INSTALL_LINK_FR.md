@@ -9,7 +9,7 @@ sources modifiées, vérifie son empreinte SHA-256 et construit nos images Docke
 Il n'utilise pas les images officielles, qui ne contiennent pas nos modifications.
 
 Le dépôt est `GauhthierH/mineos-custom-discord`. La préversion avec les fichiers standards
-est `custom-discord-2026.11.05-preview.5`. Le script est disponible à une adresse
+est `custom-discord-2026.11.05-preview.6`. Le script est disponible à une adresse
 fixe sur sa branche `vibing`. Utiliser **--preview** pour cette première version.
 
 Après publication d'une première release stable custom, la commande sera :

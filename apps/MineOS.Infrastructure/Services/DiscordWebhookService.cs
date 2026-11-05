@@ -54,7 +54,8 @@ public sealed class DiscordWebhookService : BackgroundService, IDiscordWebhookSe
                     foreach (var rule in configuration.Rules.Where(r => DiscordMessageRenderer.Matches(r, evt)))
                     foreach (var destination in configuration.Destinations.Where(d => d.Enabled && rule.DestinationIds.Contains(d.Id)))
                         await DeliverAsync(destination, evt,
-                            DiscordMessageRenderer.BuildPayload(evt, rule, configuration.Username), stoppingToken);
+                            DiscordMessageRenderer.BuildPayload(evt, rule, configuration.Username,
+                                footerText: configuration.FooterText), stoppingToken);
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
                 catch (Exception ex)
@@ -87,7 +88,8 @@ public sealed class DiscordWebhookService : BackgroundService, IDiscordWebhookSe
         var evt = definition.Sample(request.ServerName);
         // A manual test deliberately works even while automatic delivery is paused.
         return await DeliverAsync(destination, evt,
-            DiscordMessageRenderer.BuildPayload(evt, rule, configuration.Username, isTest: true), ct);
+            DiscordMessageRenderer.BuildPayload(evt, rule, configuration.Username, isTest: true,
+                footerText: configuration.FooterText), ct);
     }
 
     private async Task<DiscordTestResult> DeliverAsync(DiscordDestination destination, DiscordEvent evt, string payload, CancellationToken ct)

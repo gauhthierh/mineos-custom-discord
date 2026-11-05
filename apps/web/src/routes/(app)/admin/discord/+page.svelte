@@ -84,7 +84,8 @@
 		try {
 			preview = { ruleId: rule.id, payload: await request('preview', {
 				rule, eventType: samples[rule.id] ?? rule.eventTypes[0],
-				serverName: rule.serverNames[0] ?? 'serveur-exemple', username: configuration.username
+				serverName: rule.serverNames[0] ?? 'serveur-exemple', username: configuration.username,
+				footerText: configuration.footerText
 			}) };
 		} catch (error) { report(error); }
 		finally { busy = ''; }
@@ -128,6 +129,7 @@
 			<div><h2 id="general-title">Notifications automatiques</h2><p>Crée des règles pour chaque événement. Un événement sans règle reste silencieux.</p></div>
 			<label class="switch"><input type="checkbox" bind:checked={configuration.enabled} />{configuration.enabled ? 'Activées' : 'En pause'}</label>
 			<label class="sender">Nom de l’expéditeur<input maxlength="80" bind:value={configuration.username} /></label>
+			<label class="sender">Texte en bas des cartes<input maxlength="80" placeholder="MineOS" bind:value={configuration.footerText} /><small>Par défaut : MineOS. Exemple : Noryandor. Un champ vide rétablit MineOS.</small></label>
 			<div class="summary">{configuration.destinations.length} salon(s) · {activeRules} règle(s) active(s)</div>
 		</section>
 		{#if !configuration.enabled}<p class="notice">Les envois automatiques sont en pause. Les tests manuels restent disponibles après enregistrement.</p>{/if}
@@ -203,7 +205,7 @@
 					{#if preview?.ruleId === rule.id}
 						<div class="discord-preview"><strong>{preview.payload.username}</strong><span class="app-badge">APP</span>
 							{#if preview.payload.content}<p class="message-content">{preview.payload.content}</p>{/if}
-							{#each preview.payload.embeds ?? [] as embed}<div class="embed" style:border-left-color={`#${embed.color.toString(16).padStart(6, '0')}`}><h4>{embed.title}</h4><p class="message-content">{embed.description}</p>{#each embed.fields ?? [] as field}<p><strong>{field.name}</strong><br />{field.value}</p>{/each}<small>MineOS{embed.timestamp ? ` · ${new Date(embed.timestamp).toLocaleString('fr-FR')}` : ''}</small></div>{/each}
+							{#each preview.payload.embeds ?? [] as embed}<div class="embed" style:border-left-color={`#${embed.color.toString(16).padStart(6, '0')}`}><h4>{embed.title}</h4><p class="message-content">{embed.description}</p>{#each embed.fields ?? [] as field}<p><strong>{field.name}</strong><br />{field.value}</p>{/each}<small>{embed.footer?.text ?? 'MineOS'}{embed.timestamp ? ` · ${new Date(embed.timestamp).toLocaleString('fr-FR')}` : ''}</small></div>{/each}
 							<p class="hint">Exemple, sans envoi. Actualise l’aperçu après une modification. Discord appliquera sa mise en forme au message reçu.</p></div>
 					{/if}
 				</article>

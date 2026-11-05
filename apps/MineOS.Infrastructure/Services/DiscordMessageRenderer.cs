@@ -15,7 +15,9 @@ public sealed class DiscordNotificationPreview : IDiscordNotificationPreview
             throw new ArgumentException("Nom d'expéditeur ou de serveur invalide.");
         var definition = DiscordEvents.Catalog.FirstOrDefault(e => e.Id == request.EventType)
             ?? throw new ArgumentException("Événement inconnu.");
-        return DiscordMessageRenderer.BuildPayload(definition.Sample(request.ServerName), request.Rule, request.Username);
+        var footerText = DiscordNotificationSettings.NormalizeFooterText(request.FooterText);
+        return DiscordMessageRenderer.BuildPayload(definition.Sample(request.ServerName), request.Rule,
+            request.Username, footerText: footerText);
     }
 }
 
@@ -26,7 +28,8 @@ public static partial class DiscordMessageRenderer
         && (rule.ServerNames.Count == 0 || (evt.ServerName is not null
             && rule.ServerNames.Contains(evt.ServerName, StringComparer.Ordinal)));
 
-    public static string BuildPayload(DiscordEvent evt, DiscordNotificationRule? rule = null, string username = "MineOS", bool isTest = false)
+    public static string BuildPayload(DiscordEvent evt, DiscordNotificationRule? rule = null, string username = "MineOS",
+        bool isTest = false, string footerText = "MineOS")
     {
         rule ??= new();
         var title = Render(rule.TitleTemplate, evt);
@@ -46,7 +49,7 @@ public static partial class DiscordMessageRenderer
                 ["title"] = Clip(title, 256), ["description"] = Clip(message, 4096),
                 ["color"] = rule.Color is null ? ColorFor(evt.Level)
                     : int.Parse(rule.Color[1..], NumberStyles.HexNumber, CultureInfo.InvariantCulture),
-                ["footer"] = new { text = "MineOS" }
+                ["footer"] = new { text = Clip(string.IsNullOrWhiteSpace(footerText) ? "MineOS" : footerText.Trim(), 80) }
             };
             if (rule.ShowTimestamp) embed["timestamp"] = evt.Timestamp.UtcDateTime.ToString("o");
             if (rule.ShowServer && evt.ServerName is { Length: > 0 })

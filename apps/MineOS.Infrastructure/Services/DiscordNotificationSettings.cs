@@ -34,6 +34,7 @@ public sealed partial class DiscordNotificationSettings(ISettingsService setting
                 };
             }
         }
+        configuration = configuration with { FooterText = NormalizeFooterText(configuration.FooterText) };
         return includeSecrets ? configuration : Redact(configuration);
     }
 
@@ -53,7 +54,8 @@ public sealed partial class DiscordNotificationSettings(ISettingsService setting
                     throw new ArgumentException($"Le salon « {destination.Name} » nécessite une URL de webhook Discord HTTPS valide.");
                 return destination with { Name = destination.Name.Trim(), WebhookUrl = url, HasWebhook = true };
             }).ToList();
-            configuration = configuration with { Username = configuration.Username.Trim(), Destinations = destinations };
+            configuration = configuration with { Username = configuration.Username.Trim(),
+                FooterText = NormalizeFooterText(configuration.FooterText), Destinations = destinations };
             await settings.SetAsync(SettingKey, JsonSerializer.Serialize(configuration, JsonOptions), ct);
             return Redact(configuration);
         }
@@ -78,6 +80,7 @@ public sealed partial class DiscordNotificationSettings(ISettingsService setting
             throw new ArgumentException("Maximum : 20 salons et 60 règles.");
         if (string.IsNullOrWhiteSpace(configuration.Username) || configuration.Username.Length > 80)
             throw new ArgumentException("Le nom de l'expéditeur doit contenir entre 1 et 80 caractères.");
+        NormalizeFooterText(configuration.FooterText);
         var destinations = new HashSet<string>(StringComparer.Ordinal);
         foreach (var destination in configuration.Destinations)
         {
@@ -92,6 +95,13 @@ public sealed partial class DiscordNotificationSettings(ISettingsService setting
             if (!rules.Add(rule.Id) || rule.DestinationIds.Any(id => !destinations.Contains(id)))
                 throw new ArgumentException("Une règle contient un identifiant en double ou un salon inexistant.");
         }
+    }
+
+    public static string NormalizeFooterText(string? text)
+    {
+        if (text is { Length: > 80 })
+            throw new ArgumentException("Le texte en bas des cartes doit contenir au maximum 80 caractères.");
+        return string.IsNullOrWhiteSpace(text) ? "MineOS" : text.Trim();
     }
 
     public static void ValidateRule(DiscordNotificationRule? rule)
