@@ -4,12 +4,12 @@ services:
       context: ./apps
       dockerfile: MineOS.Api/Dockerfile
       args:
-        MINEOS_IMAGE_TAG: ${MINEOS_IMAGE_TAG:-latest}
+        MINEOS_IMAGE_TAG: ${MINEOS_IMAGE_TAG:-custom-discord}
 
   web:
     build:
       context: ./apps/web
       dockerfile: Dockerfile
       args:
-        PUBLIC_BUILD_ID: ${PUBLIC_BUILD_ID:-dev}
+        PUBLIC_BUILD_ID: ${PUBLIC_BUILD_ID:-custom-discord-v1}
         PUBLIC_MINECRAFT_HOST: ${PUBLIC_MINECRAFT_HOST:-}

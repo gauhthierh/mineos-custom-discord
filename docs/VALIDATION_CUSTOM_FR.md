@@ -2,7 +2,21 @@
 
 Date : 5 novembre 2026. Base d'origine : branche `vibing`, commit `12bbed1`.
 
-## Résultats
+## Révision avec fichiers standards (preview.3)
+
+- Déploiement normalisé sur `.env`, `docker-compose.yml` et `install.sh`.
+- Lancement sans options supplémentaires : `docker compose up -d`.
+- Port par défaut d'une installation neuve : 6070, accessible sur le réseau.
+- Quatre tests de résolution Compose vérifient les identifiants, les images
+  modifiées, les ports, les chemins et les anciens réglages.
+- Test de génération et de migration dans un dossier jetable : secrets conservés,
+  conflit entre deux fichiers de secrets refusé et données non supprimées.
+- Suite .NET relancée : 334 tests réussis.
+- Vérification de l'interface relancée : aucune erreur, 93 avertissements existants.
+- Le workflow de cette révision teste aussi le démarrage et la connexion réelle
+  du compte administrateur, puis les routes Discord authentifiées, sur Linux.
+
+## Résultats de la première préversion
 
 - Suite .NET complète : **334 tests réussis, aucun échec, aucun test ignoré**.
 - Tests unitaires de l'interface : **136 tests réussis**.

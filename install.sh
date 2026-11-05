@@ -1,332 +1,163 @@
 #!/usr/bin/env bash
-
-REPO_URL="https://github.com/freeman412/mineos-sveltekit.git"
-INSTALL_DIR="${MINEOS_INSTALL_DIR:-mineos}"
-REF="main"
-BUILD=false
-BUNDLE_URL=""
-CLI_URL=""
-INSTALL_CLI=true
-VERSION=""
-PREVIEW=false
-FORWARD_ARGS=()
-
 set -euo pipefail
 
+# The release workflow rewrites this default when published from another fork.
+repository='GauhthierH/mineos-custom-discord'
+install_dir="${HOME}/mineos"
+version=''
+preview=false
+dry_run=false
+
+fail() { printf 'Erreur : %s\n' "$*" >&2; exit 1; }
 usage() {
-    cat <<'EOF'
-MineOS installer
+  cat <<'EOF'
+MineOS custom — installation neuve sur Debian 13
+Options :
+  --preview              Dernière préversion custom publiée
+  --version custom-TAG   Version custom précise
+  --dir /chemin          Dossier d'installation (défaut : ~/mineos)
+  --repository NOM/DEPOT Dépôt GitHub public (renseigné dans le script publié)
+  --dry-run              Afficher le choix sans rien installer ni télécharger
+  --help                 Afficher cette aide
 
-Usage:
-  curl -fsSL https://mineos.net/install.sh | bash
-  curl -fsSL https://mineos.net/install.sh | bash -s -- --build
-  curl -fsSL https://mineos.net/install.sh | bash -s -- --version v1.0.0
-
-Options:
-  --build           Clone repo and build from source
-  --ref <ref>       Git ref for --build (default: main)
-  --dir <path>      Install directory (default: ./mineos)
-  --repo <url>      Git repo for --build
-  --version <tag>   Download specific release version (e.g., v1.0.0)
-  --preview         Install the latest preview (pre-release) version
-  --bundle-url <u>  Override bundle download URL
-  --cli-url <u>     Override mineos-cli download URL
-  --no-cli          Skip mineos-cli download
-  -h, --help        Show this help
+Le script installe les prérequis et Docker si nécessaire, télécharge notre
+version, vérifie son empreinte, génère les identifiants et construit les images.
+Il refuse d'écraser un dossier existant. Le panel écoute sur le port 6070. Les fichiers utilisés sont .env et docker-compose.yml.
 EOF
 }
 
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-get_latest_bundle_url() {
-    local asset_name="$1"
-    local version="${2:-}"
-    local api
-    if [ -n "$version" ]; then
-        api="https://api.github.com/repos/freeman412/mineos-sveltekit/releases/tags/$version"
-    else
-        api="https://api.github.com/repos/freeman412/mineos-sveltekit/releases/latest"
-    fi
-
-    if command_exists python3; then
-        python3 - <<'PY' "$api" "$asset_name"
-import json, sys, urllib.request
-api = sys.argv[1]
-asset = sys.argv[2]
-with urllib.request.urlopen(api) as resp:
-    data = json.load(resp)
-for item in data.get("assets", []):
-    if item.get("name") == asset:
-        print(item.get("browser_download_url", ""))
-        break
-PY
-        return
-    fi
-
-    if command_exists python; then
-        python - <<'PY' "$api" "$asset_name"
-import json, sys
-try:
-    import urllib2 as urllib
-except ImportError:
-    import urllib.request as urllib
-api = sys.argv[1]
-asset = sys.argv[2]
-resp = urllib.urlopen(api)
-data = json.loads(resp.read().decode("utf-8"))
-for item in data.get("assets", []):
-    if item.get("name") == asset:
-        print(item.get("browser_download_url", ""))
-        break
-PY
-        return
-    fi
-
-    curl -fsSL "$api" | grep -m 1 "\"browser_download_url\": \".*${asset_name}\"" | \
-        sed -E 's/.*"([^"]+)".*/\1/'
-}
-
-get_latest_prerelease_tag() {
-    local api="https://api.github.com/repos/freeman412/mineos-sveltekit/releases"
-
-    if command_exists python3; then
-        python3 - <<'PY' "$api"
-import json, sys, urllib.request
-api = sys.argv[1]
-with urllib.request.urlopen(api) as resp:
-    data = json.load(resp)
-for release in data:
-    if release.get("prerelease"):
-        print(release.get("tag_name", ""))
-        break
-PY
-        return
-    fi
-
-    if command_exists python; then
-        python - <<'PY' "$api"
-import json, sys
-try:
-    import urllib2 as urllib
-except ImportError:
-    import urllib.request as urllib
-api = sys.argv[1]
-resp = urllib.urlopen(api)
-data = json.loads(resp.read().decode("utf-8"))
-for release in data:
-    if release.get("prerelease"):
-        print(release.get("tag_name", ""))
-        break
-PY
-        return
-    fi
-
-    # Fallback: use curl + grep
-    curl -fsSL "$api" | grep -m 1 '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/'
-}
-
-detect_platform() {
-    local os
-    local arch
-
-    os=$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    case "$os" in
-        linux) os="linux" ;;
-        darwin) os="darwin" ;;
-        *) return 1 ;;
-    esac
-
-    arch=$(uname -m 2>/dev/null)
-    case "$arch" in
-        x86_64|amd64) arch="amd64" ;;
-        arm64|aarch64) arch="arm64" ;;
-        *) return 1 ;;
-    esac
-
-    echo "${os}:${arch}"
-}
-
-extract_zip() {
-    local zip_path="$1"
-    local dest_dir="$2"
-
-    mkdir -p "$dest_dir"
-    if command_exists unzip; then
-        unzip -o -q "$zip_path" -d "$dest_dir"
-        return
-    fi
-    if command_exists python3; then
-        python3 - <<'PY' "$zip_path" "$dest_dir"
-import sys, zipfile
-zip_path = sys.argv[1]
-dest = sys.argv[2]
-with zipfile.ZipFile(zip_path, 'r') as zf:
-    zf.extractall(dest)
-PY
-        return
-    fi
-    if command_exists python; then
-        python - <<'PY' "$zip_path" "$dest_dir"
-import sys, zipfile
-zip_path = sys.argv[1]
-dest = sys.argv[2]
-with zipfile.ZipFile(zip_path, 'r') as zf:
-    zf.extractall(dest)
-PY
-        return
-    fi
-    return 1
-}
-
-install_cli() {
-    if [ "$INSTALL_CLI" != true ]; then
-        return 0
-    fi
-
-    platform=$(detect_platform || true)
-    if [ -z "$platform" ]; then
-        echo "[WARN] Unsupported platform for mineos-cli (expected linux/darwin amd64/arm64)."
-        return 0
-    fi
-
-    os="${platform%%:*}"
-    arch="${platform##*:}"
-    asset="mineos-cli_${os}_${arch}.zip"
-    local_bundle_zip="./cli/${asset}"
-    cli_zip="${tmp_dir}/${asset}"
-    if [ -f "$local_bundle_zip" ]; then
-        echo "[INFO] Using bundled mineos-cli (${os}/${arch})..."
-        cp "$local_bundle_zip" "$cli_zip"
-    else
-        if [ -z "$CLI_URL" ]; then
-            CLI_URL=$(get_latest_bundle_url "$asset" "$VERSION")
-        fi
-        if [ -z "$CLI_URL" ]; then
-            echo "[WARN] Unable to locate mineos-cli asset for ${os}/${arch}. Skipping."
-            return 0
-        fi
-        echo "[INFO] Downloading mineos-cli (${os}/${arch})..."
-        curl -fsSL "$CLI_URL" -o "$cli_zip"
-    fi
-    if extract_zip "$cli_zip" "$tmp_dir/cli"; then
-        bin_name="mineos-${os}-${arch}"
-        if [ -f "$tmp_dir/cli/$bin_name" ]; then
-            mv "$tmp_dir/cli/$bin_name" "./mineos"
-            chmod +x "./mineos"
-            echo "[INFO] Installed mineos-cli to ${INSTALL_DIR}/mineos"
-        else
-            echo "[WARN] mineos-cli binary not found in archive."
-        fi
-    else
-        echo "[WARN] unzip/python not available; skipping mineos-cli install."
-    fi
-}
-
-run_cli_installer() {
-    local cli="./mineos"
-    if [ ! -x "$cli" ]; then
-        if command_exists mineos; then
-            cli="mineos"
-        else
-            echo "[ERR] mineos-cli not found. Re-run without --no-cli."
-            exit 1
-        fi
-    fi
-
-    # Redirect stdin from /dev/tty so CLI can read interactive input
-    # even when this script is piped (curl | bash)
-    "$cli" install "$@" < /dev/tty
-}
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --build) BUILD=true ;;
-        --ref) REF="${2:-}"; shift ;;
-        --dir) INSTALL_DIR="${2:-}"; shift ;;
-        --repo) REPO_URL="${2:-}"; shift ;;
-        --version) VERSION="${2:-}"; shift ;;
-        --preview) PREVIEW=true ;;
-        --bundle-url) BUNDLE_URL="${2:-}"; shift ;;
-        --cli-url) CLI_URL="${2:-}"; shift ;;
-        --no-cli) INSTALL_CLI=false ;;
-        -h|--help) usage; exit 0 ;;
-        *) FORWARD_ARGS+=("$1") ;;
-    esac
-    shift
+while (( $# )); do
+  case "$1" in
+    --preview) preview=true; shift ;;
+    --dry-run) dry_run=true; shift ;;
+    --help|-h) usage; exit 0 ;;
+    --version|--dir|--repository)
+      (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || fail "Valeur manquante pour $1."
+      case "$1" in
+        --version) version="$2" ;;
+        --dir) install_dir="$2" ;;
+        --repository) repository="$2" ;;
+      esac
+      shift 2 ;;
+    *) fail "Option inconnue : $1" ;;
+  esac
 done
 
-if [ -z "$INSTALL_DIR" ]; then
-    echo "[ERR] Install directory is required."
-    exit 1
+[[ "$repository" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+  || fail 'Le dépôt custom doit être renseigné avant publication (--repository NOM/DEPOT).'
+[[ -z "$version" || "$version" =~ ^custom-[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ ]] \
+  || fail 'La version doit être un tag custom-*.'
+[[ "$preview" != true || -z "$version" ]] || fail '--preview et --version ne se combinent pas.'
+[[ "$install_dir" == /* && "$install_dir" != / && "$install_dir" != *$'\n'* && "$install_dir" != *$'\r'* ]] \
+  || fail "Le dossier doit être un chemin absolu distinct de /."
+# Refuse traversal before passing the path to privileged filesystem commands.
+[[ "/${install_dir#/}/" != *'/../'* && "/${install_dir#/}/" != *'/./'* ]] || fail 'Chemin non normalisé.'
+if [[ "$dry_run" == true ]]; then
+  printf 'Dépôt : %s\nDossier : %s\nVersion : %s\n' "$repository" "$install_dir" "${version:-latest}"
+  printf 'Préversion : %s\nAucun changement effectué.\n' "$preview"
+  exit 0
 fi
 
-if [ "$BUILD" = true ]; then
-    if ! command_exists git; then
-        echo "[ERR] git is required for --build."
-        exit 1
+[[ -f /etc/os-release ]] || fail 'Ce script nécessite Debian 13.'
+# shellcheck disable=SC1091
+. /etc/os-release
+[[ "${ID:-}" == debian && "${VERSION_ID:-}" == 13 ]] || fail 'Ce script cible une installation neuve sur Debian 13.'
+[[ ! -e "$install_dir" && ! -L "$install_dir" ]] || fail "Le dossier $install_dir existe déjà. Aucun fichier remplacé."
+architecture=$(dpkg --print-architecture)
+[[ "$architecture" == amd64 || "$architecture" == arm64 ]] || fail 'Architecture prise en charge : amd64 ou arm64.'
+
+root_command=()
+if (( EUID != 0 )); then
+  command -v sudo >/dev/null || fail 'Exécute ce script avec un compte disposant de sudo.'
+  sudo -v
+  root_command=(sudo)
+fi
+as_root() { "${root_command[@]}" "$@"; }
+download() { curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 20 --max-time 300 "$1" -o "$2"; }
+
+printf '%s\n' 'Préparation des outils nécessaires…'
+as_root apt-get update
+as_root apt-get install -y ca-certificates curl tar gzip openssl python3
+if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1; then
+  for package in docker.io docker-compose docker-doc docker-buildx podman-docker containerd runc; do
+    if [[ "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)" == installed ]]; then
+      fail "Le paquet $package est déjà installé. Vérifie l'installation Docker existante avant de continuer."
     fi
-
-    if [ -d "$INSTALL_DIR/.git" ]; then
-        echo "[INFO] Using existing repo at $INSTALL_DIR"
-    elif [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
-        echo "[ERR] Directory $INSTALL_DIR exists and is not empty."
-        exit 1
-    else
-        echo "[INFO] Cloning repo..."
-        git clone --depth 1 --branch "$REF" "$REPO_URL" "$INSTALL_DIR"
-    fi
-
-    cd "$INSTALL_DIR"
-    tmp_dir=$(mktemp -d)
-    install_cli
-    run_cli_installer --build ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
-    exit 0
+  done
+  printf '%s\n' 'Installation de Docker depuis son dépôt officiel…'
+  as_root install -m 0755 -d /etc/apt/keyrings
+  as_root curl --proto '=https' --tlsv1.2 -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  as_root chmod a+r /etc/apt/keyrings/docker.asc
+  printf 'Types: deb\nURIs: https://download.docker.com/linux/debian\nSuites: trixie\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' "$architecture" \
+    | as_root tee /etc/apt/sources.list.d/mineos-custom-docker.sources >/dev/null
+  as_root apt-get update
+  as_root apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 fi
+as_root systemctl enable --now docker
+as_root docker info >/dev/null
 
-if ! command_exists curl; then
-    echo "[ERR] curl is required to download the install bundle."
-    exit 1
+work_dir=$(mktemp -d /tmp/mineos-custom.XXXXXXXX)
+cleanup() {
+  # Only the exact temporary directory created above may be removed.
+  if [[ "$work_dir" == /tmp/mineos-custom.* && -d "$work_dir" && ! -L "$work_dir" ]]; then
+    rm -rf -- "$work_dir"
+  fi
+}
+trap cleanup EXIT
+api="https://api.github.com/repos/$repository/releases"
+if [[ "$preview" == true ]]; then
+  download "$api?per_page=100" "$work_dir/releases.json"
+  version=$(python3 - "$work_dir/releases.json" <<'PY'
+import json, sys
+releases = json.load(open(sys.argv[1], encoding="utf-8"))
+candidates = [r for r in releases if r.get("prerelease") and not r.get("draft")
+              and r.get("tag_name", "").startswith("custom-")]
+if not candidates:
+    sys.exit("Aucune préversion custom publiée.")
+print(max(candidates, key=lambda r: r.get("published_at") or "")["tag_name"])
+PY
+  )
+elif [[ -z "$version" ]]; then
+  download "$api/latest" "$work_dir/release.json"
+  version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["tag_name"])' "$work_dir/release.json")
 fi
-if ! command_exists tar; then
-    echo "[ERR] tar is required to extract the install bundle."
-    exit 1
-fi
+[[ "$version" =~ ^custom-[A-Za-z0-9][A-Za-z0-9._-]{0,100}$ ]] || fail 'La release sélectionnée n’est pas une version custom reconnue.'
+base="https://github.com/$repository/releases/download/$version"
+archive='mineos-custom-source.tar.gz'
+printf 'Téléchargement de %s…\n' "$version"
+download "$base/$archive" "$work_dir/$archive"
+download "$base/$archive.sha256" "$work_dir/$archive.sha256"
+expected=$(awk 'NR == 1 { print $1 }' "$work_dir/$archive.sha256")
+[[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || fail 'Empreinte publiée invalide.'
+actual=$(sha256sum "$work_dir/$archive" | cut -d ' ' -f 1)
+[[ "${expected,,}" == "$actual" ]] || fail 'Le fichier téléchargé ne correspond pas à son empreinte.'
 
-# Resolve --preview to the latest prerelease tag
-if [ "$PREVIEW" = true ] && [ -z "$VERSION" ]; then
-    echo "[INFO] Looking up latest preview release..."
-    VERSION=$(get_latest_prerelease_tag)
-    if [ -z "$VERSION" ]; then
-        echo "[ERR] No pre-release version found."
-        exit 1
-    fi
-    echo "[INFO] Found preview version: $VERSION"
-    echo ""
-    echo "[WARN] Preview versions may be unstable, contain bugs, or cause data loss."
-    echo "[WARN] Do not use preview releases in production. Back up your data first."
-    echo ""
-    FORWARD_ARGS+=("--image-tag" "preview")
-fi
-
-if [ -z "$BUNDLE_URL" ]; then
-    BUNDLE_URL=$(get_latest_bundle_url "mineos-install-bundle.tar.gz" "$VERSION")
-fi
-
-if [ -z "$BUNDLE_URL" ]; then
-    echo "[ERR] Unable to locate install bundle URL."
-    exit 1
-fi
-
-tmp_dir=$(mktemp -d)
-bundle_path="${tmp_dir}/mineos-install-bundle.tar.gz"
-echo "[INFO] Downloading install bundle..."
-curl -fsSL "$BUNDLE_URL" -o "$bundle_path"
-
-mkdir -p "$INSTALL_DIR"
-tar -xzf "$bundle_path" -C "$INSTALL_DIR"
-
-cd "$INSTALL_DIR"
-install_cli
-run_cli_installer ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+# Reject links and traversal before extracting anything from the verified bundle.
+python3 - "$work_dir/$archive" "$work_dir/source" <<'PY'
+import pathlib, sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as archive:
+    members = archive.getmembers()
+    if sum(m.size for m in members) > 500 * 1024 * 1024:
+        sys.exit("Archive trop volumineuse.")
+    for member in members:
+        path = pathlib.PurePosixPath(member.name)
+        if path.is_absolute() or ".." in path.parts or not (member.isfile() or member.isdir()):
+            sys.exit("Chemin ou type de fichier interdit dans l'archive.")
+    archive.extractall(sys.argv[2], members=members, filter="data")
+PY
+[[ -f "$work_dir/source/docker-compose.yml" && -f "$work_dir/source/scripts/prepare.sh" ]] \
+  || fail 'Le paquet ne contient pas notre version custom.'
+as_root mkdir -p -- "$(dirname -- "$install_dir")"
+as_root mkdir -- "$install_dir"
+as_root chown "$(id -u):$(id -g)" -- "$install_dir"
+cp -R -- "$work_dir/source/." "$install_dir/"
+cd -- "$install_dir"
+bash scripts/prepare.sh
+printf '%s\n' 'Construction de notre version. Cette première étape peut prendre plusieurs minutes…'
+as_root docker compose config --quiet
+as_root docker compose up -d --build --wait --wait-timeout 180
+as_root docker compose ps
+printf '\nVersion installée : %s\nDossier : %s\n' "$version" "$install_dir"
+printf '%s\n' 'Compte initial : admin. Mot de passe dans .env (non affiché ici).'
+printf '%s\n' 'Ouvrir http://ADRESSE_DU_DEBIAN:6070 puis la page Discord.'
+printf '%s\n' 'Commandes habituelles : docker compose ps ; docker compose logs ; docker compose up -d.'

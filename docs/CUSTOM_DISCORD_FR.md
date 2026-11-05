@@ -79,7 +79,7 @@ Supprimer le salon dans MineOS supprime sa destination de la configuration ; cel
 ne supprime pas le webhook dans Discord.
 
 La configuration contient des secrets dans la base : protéger le dossier `data`
-et ses sauvegardes comme le fichier `.env.custom`. Les journaux HTTP du client
+et ses sauvegardes comme le fichier `.env`. Les journaux HTTP du client
 Discord sont désactivés pour éviter de journaliser les jetons présents dans les URL.
 
 L'historique conserve les 100 derniers résultats d'envoi **en mémoire**, y compris
@@ -96,67 +96,74 @@ toutes les règles ne réactive pas l'ancien webhook.
 
 ## Installation neuve sur Debian 13
 
-L'installateur en une commande et sa procédure de publication sont décrits dans
-[INSTALL_LINK_FR.md](INSTALL_LINK_FR.md). La procédure manuelle ci-dessous reste disponible.
-
-Cette procédure est préparée pour le déploiement ultérieur. Elle n'a pas encore
-été exécutée sur le Debian du propriétaire. La construction et le démarrage
-des conteneurs ont réussi sur le serveur Linux de validation GitHub.
-
-1. Installer Docker Engine et le plugin Compose selon la documentation officielle :
-   https://docs.docker.com/engine/install/debian/
-2. Transférer **notre copie modifiée du dépôt** dans un dossier dédié, par exemple
-   `/opt/mineos-custom`. Cloner uniquement le dépôt d'origine ne récupère pas nos changements.
-   Ne pas transférer `.tools`, `node_modules`, `bin`, `obj` ni les données de test.
-3. Dans ce dossier, préparer les identifiants :
-
 ```bash
-bash scripts/prepare-custom.sh
+curl -fsSL https://raw.githubusercontent.com/GauhthierH/mineos-custom-discord/vibing/install.sh | bash -s -- --preview
 ```
 
-Le script crée `.env.custom` avec des secrets aléatoires et des permissions réservées
-au propriétaire. Il ne remplace jamais un fichier existant. Le compte initial est
-`admin` ; son mot de passe se trouve dans `.env.custom`. Modifier le nom du compte
-avant le premier lancement si souhaité.
+L'installateur crée `~/mineos`, prépare `.env`, construit nos sources et attend le
+démarrage des services. Il refuse d'écraser un dossier existant. Modifier le chemin
+avec `--dir /chemin/absolu` si nécessaire. L'installation complète de cette révision
+sur le Debian du propriétaire reste à vérifier.
 
-4. Vérifier la configuration et construire notre version :
-
-```bash
-docker compose --env-file .env.custom -f compose.custom.yml config --quiet
-docker compose --env-file .env.custom -f compose.custom.yml up -d --build --wait --wait-timeout 180
-docker compose --env-file .env.custom -f compose.custom.yml ps
-```
-
-Utiliser `sudo` si le compte n'a pas accès à Docker. Les serveurs Minecraft et la
-base sont conservés dans `minecraft/` et `data/` à côté du fichier Compose.
-Java et les outils nécessaires sont intégrés à l'image API.
-
-Par défaut, le panel écoute seulement sur la boucle locale du Debian. Pour y
-accéder depuis son ordinateur pendant l'installation :
+Le compte initial est `admin` ; le mot de passe est généré dans `.env` avec des
+permissions réservées au propriétaire. Pour une installation manuelle depuis nos
+sources, exécuter `bash scripts/prepare.sh` puis :
 
 ```bash
-ssh -L 3000:127.0.0.1:3000 utilisateur@adresse-du-debian
+docker compose config --quiet
+docker compose up -d --build --wait --wait-timeout 180
+docker compose ps
 ```
 
-Puis ouvrir `http://localhost:3000` sur son ordinateur. On configurera l'adresse
-réseau ou un domaine avec HTTPS selon l'accès souhaité. Les ports Minecraft par
-défaut sont `25565–25570` et `19132–19137` ; les plages sont réglables dans `.env.custom`.
+Utiliser `sudo` si nécessaire. Aucune option `--env-file` ou `-f` n'est requise.
+Les fichiers habituels sont `.env` et `docker-compose.yml`.
+Ouvrir **http://ADRESSE_DU_DEBIAN:6070**. Le panel écoute sur les interfaces réseau
+par défaut ; `WEB_BIND_ADDRESS` et `WEB_PORT` permettent de changer cet accès.
+Les anciens réglages sont conservés lors d'une migration, y compris le port 3000
+et l'écoute locale des premières préversions.
 
-Les images sont nommées `mineos-custom-api:discord-v1` et `mineos-custom-web:discord-v1`
-et sont construites depuis nos sources. Le fichier Compose custom n'utilise pas
-les images publiées du projet d'origine et ne monte pas le socket Docker dans l'API.
-L'API est accessible uniquement entre les conteneurs. L'interface utilise Node.js 24.
-La télémétrie est désactivée dans ce déploiement.
+Les données restent dans `minecraft/` et `data/`, réglables par
+`HOST_BASE_DIRECTORY` et `Data__Directory`. Les ports Minecraft restent
+`25565–25570` et `19132–19137`. L'API est interne aux conteneurs ; le panneau permet
+d'utiliser toutes ses fonctions. Le socket Docker n'est pas monté.
+Les images locales `mineos-custom-api:discord-v1` et `mineos-custom-web:discord-v1`
+sont construites depuis nos sources, sans tirer les images officielles.
+Les intégrations, les chemins, les modèles et les règles Discord restent configurables.
 
-### Mise à jour de notre version
+### Migration des premières préversions
 
-Sauvegarder `data/`, `minecraft/` et `.env.custom` avant toute migration.
-Pour une sauvegarde cohérente de la base et des mondes, arrêter proprement les
-serveurs puis les conteneurs avant de copier ces dossiers.
+Cette procédure conserve les identifiants, la base, les mondes et les réglages.
+Prévoir une interruption et arrêter proprement les serveurs Minecraft avant de
+sauvegarder `data/`, `minecraft/` et le fichier de secrets.
 
-Après transfert des nouveaux fichiers sources validés, relancer la commande
-`up -d --build` ci-dessus. Ne pas utiliser `mineos update` pour ce déploiement :
-cette commande est conçue pour les versions publiées du projet d'origine.
+Télécharger le paquet `mineos-custom-source.tar.gz` et son `.sha256` depuis la
+[release preview.3](https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.05-preview.3).
+Vérifier `sha256sum -c mineos-custom-source.tar.gz.sha256` dans le dossier de téléchargement,
+puis extraire le paquet dans le dossier de l'installation existante, sans déplacer
+`data/` ou `minecraft/`. Le paquet ne contient aucun fichier `.env`.
+
+Depuis le dossier de l'installation mis à jour :
+
+```bash
+sudo bash scripts/migrate-layout.sh
+```
+
+Le script arrête l'ancien projet Compose, conserve son fichier sous
+`docker-compose.previous.yml`, renomme `.env.custom` en `.env` et reconstruit nos images.
+Il ne régénère aucun secret et ne supprime aucun volume. Si les deux fichiers
+`.env` et `.env.custom` existent, il s'arrête pour éviter de choisir les mauvais
+identifiants. Si `.env` existe seul, il est conservé.
+
+Après migration, utiliser simplement :
+
+```bash
+sudo docker compose ps
+sudo docker compose logs --tail=100
+sudo docker compose up -d
+```
+
+Pour une mise à jour suivante, sauvegarder les données et `.env`, transférer les
+nouvelles sources puis exécuter `docker compose up -d --build`.
 
 ## Vérification du développement
 

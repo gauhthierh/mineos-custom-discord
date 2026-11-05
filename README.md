@@ -3,16 +3,16 @@
 > **Version custom Discord.** Elle ajoute des salons multiples,
 > des règles par événement et serveur, des modèles de messages et un historique.
 > Voir [le guide custom](docs/CUSTOM_DISCORD_FR.md) et [l'installation par lien](docs/INSTALL_LINK_FR.md).
-> Les commandes `mineos.net` ci-dessous installent la version d'origine.
+> Installation et gestion avec les fichiers habituels `.env` et `docker-compose.yml`.
 
 ## Installation de notre préversion custom
 
 Dépôt : [gauhthierh/mineos-custom-discord](https://github.com/gauhthierh/mineos-custom-discord).
-La [préversion validée](https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.05-preview.2)
+La [préversion validée](https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.05-preview.3)
 est disponible. Installer sur Debian 13 avec :
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GauhthierH/mineos-custom-discord/vibing/scripts/install-custom.sh | bash -s -- --preview
+curl -fsSL https://raw.githubusercontent.com/GauhthierH/mineos-custom-discord/vibing/install.sh | bash -s -- --preview
 ```
 
 Le circuit de publication vérifie les tests et le démarrage Linux avant de créer
@@ -42,108 +42,35 @@ A simple web interface to create and manage Minecraft servers. Run as many serve
 - Multiple users with roles and per-server access control
 - Import existing servers, host metrics, and a `mineos` CLI with a terminal UI
 
-## Quick Install
+## Installation et gestion
 
-**What you need:**
-- [Docker Desktop](https://www.docker.com/products/docker-desktop) (Windows/Mac) or Docker + Docker Compose (Linux)
-- That's it!
+Sur Debian 13, utiliser la commande d'installation ci-dessus. Le dossier par défaut
+est `~/mineos`. Le compte initial est `admin` ; son mot de passe aléatoire est dans
+`.env`. Ouvrir `http://ADRESSE_DU_DEBIAN:6070` depuis son navigateur.
 
-### Automatic Installation (Recommended)
-
-**Linux/macOS:**
-```bash
-curl -fsSL https://mineos.net/install.sh | bash
-```
-
-**Windows (PowerShell):**
-```powershell
-iwr https://mineos.net/install.ps1 -useb | iex
-```
-
-The installer will:
-- Check Docker + Docker Compose
-- Create all necessary files and folders
-- Configure environment settings
-- Start MineOS automatically
-
-**Access MineOS:** Open [http://localhost:3000](http://localhost:3000) on the machine running MineOS — or from any other device on your network using that machine's IP or hostname (e.g. `http://192.168.1.50:3000`). Any address works; no extra configuration needed.
-
-> Getting a **403 on login** or can't connect? See the [Troubleshooting guide](docs/TROUBLESHOOTING.md).
-
-### Manual Installation
-
-If you prefer to install manually or need offline installation:
-
-1. **Download the install bundle** from the [latest GitHub release](https://github.com/freeman412/mineos-sveltekit/releases/latest):
-   - `mineos-install-bundle.tar.gz` (Linux/macOS)
-   - `mineos-install-bundle.zip` (Windows)
-
-2. **Extract the bundle:**
-   ```bash
-   # Linux/macOS
-   tar -xzf mineos-install-bundle.tar.gz
-   cd mineos
-
-   # Windows (PowerShell)
-   Expand-Archive mineos-install-bundle.zip -DestinationPath mineos
-   cd mineos
-   ```
-
-3. **Configure environment:**
-   ```bash
-   cp .env.template .env
-   # Edit .env with your preferred settings
-   ```
-
-4. **Start MineOS:**
-   ```bash
-   docker compose up -d
-   ```
-
-5. **Access MineOS:** Open [http://localhost:3000](http://localhost:3000) — or use this machine's IP/hostname from any other device (e.g. `http://192.168.1.50:3000`)
-
-## Management
-
-Use the `mineos` CLI tool to manage your installation:
+Pour une installation manuelle depuis nos sources :
 
 ```bash
-mineos status      # Check service status
-mineos stop        # Stop all services
-mineos start       # Start all services
-mineos restart     # Restart all services
-mineos logs        # View logs
-mineos update      # Update to latest version
+bash scripts/prepare.sh
+docker compose up -d --build --wait --wait-timeout 180
 ```
 
-The CLI is automatically installed during setup.
-
-## That's It!
-
-MineOS will start automatically whenever Docker starts. Create servers, install mods, and manage everything from the web interface.
-
-## Uninstall
+Les commandes habituelles utilisent directement `docker-compose.yml` et `.env` :
 
 ```bash
-mineos uninstall
+docker compose ps
+docker compose logs --tail=100
+docker compose stop
+docker compose up -d
 ```
 
-The uninstall will ask if you want to keep your server data before removing anything.
+Les serveurs sont dans `minecraft/`, la base dans `data/`. Modifier `.env` puis
+exécuter `docker compose up -d` pour appliquer un changement de port.
+Les images sont construites à partir de nos sources et contiennent les fonctions Discord.
+Le CLI d'origine n'est pas téléchargé : son mécanisme de mise à jour vise les versions officielles.
 
-## Where Are My Files?
-
-- **Server data:** `./minecraft/` folder (all your Minecraft servers)
-- **Database:** `./data/mineos.db` (MineOS settings)
-
-## Troubleshooting
-
-**Need to change ports?**
-Edit `.env` and run `docker compose restart`
-
-**Want Minecraft LAN discovery?**
-Re-run the installer and enable **host networking** when prompted. This is Linux-only and disables Docker network isolation (containers bind directly to `API_PORT`/`WEB_PORT` on the host). The installer automatically configures `docker-compose.host.yml` when needed.
-
-**Docker not found?**
-Make sure Docker Desktop (Windows/Mac) or Docker + Docker Compose (Linux) is installed and running before installing MineOS.
+Pour passer de la première préversion avec `.env.custom` au format habituel,
+consulter [la procédure de migration](docs/CUSTOM_DISCORD_FR.md#migration-des-premières-préversions).
 
 ## Screenshots
 

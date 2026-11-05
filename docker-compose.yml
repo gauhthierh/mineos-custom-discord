@@ -1,95 +1,89 @@
+# Build our sources; never replace them with the upstream published images.
 services:
-  # For LAN discovery on Linux, enable host networking via MINEOS_NETWORK_MODE=host
-  # (uses docker-compose.host.yml).
-  # MineOS API
   api:
-    image: ghcr.io/freeman412/mineos-api:${MINEOS_IMAGE_TAG:-latest}
-    container_name: mineos-api
+    image: mineos-custom-api:discord-v1
+    pull_policy: never
+    build:
+      context: ./apps
+      dockerfile: MineOS.Api/Dockerfile
+      args:
+        MINEOS_IMAGE_TAG: custom-discord
     restart: unless-stopped
+    stop_grace_period: 5m
     environment:
-      - ASPNETCORE_ENVIRONMENT=Production
-      - ASPNETCORE_URLS=http://+:5078
-      - ConnectionStrings__DefaultConnection=${ConnectionStrings__DefaultConnection}
-      - Auth__SeedUsername=${Auth__SeedUsername}
-      - Auth__SeedPassword=${Auth__SeedPassword}
-      - Auth__Jwt__SigningKey=${Auth__JwtSecret}
-      - Auth__Jwt__Issuer=${Auth__JwtIssuer:-mineos}
-      - Auth__Jwt__Audience=${Auth__JwtAudience:-mineos}
-      - Auth__Jwt__ExpiresMinutes=${Auth__JwtExpiryMinutes:-60}
-      - ApiKey__SeedKey=${ApiKey__SeedKey}
-      # Always use container path - host path is only for volume mount
-      - Host__BaseDirectory=/var/games/minecraft
-      - Host__ServersPathSegment=${Host__ServersPathSegment:-servers}
-      - Host__ProfilesPathSegment=${Host__ProfilesPathSegment:-profiles}
-      - Host__BackupsPathSegment=${Host__BackupsPathSegment:-backups}
-      - Host__ArchivesPathSegment=${Host__ArchivesPathSegment:-archives}
-      - Host__ImportsPathSegment=${Host__ImportsPathSegment:-imports}
-      - Host__OwnerUid=${Host__OwnerUid:-1000}
-      - Host__OwnerGid=${Host__OwnerGid:-1000}
-      - CurseForge__ApiKey=${CurseForge__ApiKey:-}
-      - Discord__WebhookUrl=${Discord__WebhookUrl:-}
-      - Logging__LogLevel__Default=${Logging__LogLevel__Default:-Information}
-      - Logging__LogLevel__Microsoft.AspNetCore=Warning
-      - Cors__AllowedOrigins__0=${WEB_ORIGIN_PROD:-http://localhost:${WEB_PORT:-3000}}
-      - Cors__AllowedOrigins__1=${WEB_ORIGIN_DEV:-http://localhost:5174}
-      - Cors__AllowedOrigins__2=${WEB_ORIGIN_PROD:-}
-      - MINEOS_TELEMETRY_ENABLED=${MINEOS_TELEMETRY_ENABLED:-true}
-      - MINEOS_TELEMETRY_ENDPOINT=${MINEOS_TELEMETRY_ENDPOINT:-https://mineos.net}
-      - MINEOS_INSTALLATION_ID=${MINEOS_INSTALLATION_ID:-}
-      - MINEOS_TELEMETRY_KEY=${MINEOS_TELEMETRY_KEY:-}
-      - MINEOS_SHUTDOWN_TIMEOUT=${MINEOS_SHUTDOWN_TIMEOUT:-300}
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: http://+:5078
+      ConnectionStrings__Default: ${ConnectionStrings__DefaultConnection:-Data Source=/app/data/mineos.db}
+      Auth__SeedUsername: ${Auth__SeedUsername:-admin}
+      Auth__SeedPassword: ${Auth__SeedPassword:?Run bash scripts/prepare.sh first}
+      Auth__Jwt__SigningKey: ${Auth__JwtSecret:?Run bash scripts/prepare.sh first}
+      Auth__Jwt__Issuer: ${Auth__JwtIssuer:-mineos-custom}
+      Auth__Jwt__Audience: ${Auth__JwtAudience:-mineos-custom-web}
+      Auth__Jwt__ExpiresMinutes: ${Auth__JwtExpiryMinutes:-60}
+      ApiKey__SeedKey: ${ApiKey__SeedKey:?Run bash scripts/prepare.sh first}
+      Host__BaseDirectory: /var/games/minecraft
+      Host__RunAsUid: ${Host__OwnerUid:-${MINECRAFT_UID:-1000}}
+      Host__RunAsGid: ${Host__OwnerGid:-${MINECRAFT_GID:-1000}}
+      Host__ServersPathSegment: ${Host__ServersPathSegment:-servers}
+      Host__ProfilesPathSegment: ${Host__ProfilesPathSegment:-profiles}
+      Host__BackupsPathSegment: ${Host__BackupsPathSegment:-backups}
+      Host__ArchivesPathSegment: ${Host__ArchivesPathSegment:-archives}
+      Host__ImportsPathSegment: ${Host__ImportsPathSegment:-imports}
+      CurseForge__ApiKey: ${CurseForge__ApiKey:-}
+      Discord__WebhookUrl: ${Discord__WebhookUrl:-}
+      Logging__LogLevel__Default: ${Logging__LogLevel__Default:-Information}
+      Logging__LogLevel__Microsoft.AspNetCore: Warning
+      Cors__AllowedOrigins__0: ${WEB_ORIGIN_PROD:-http://localhost:${WEB_PORT:-6070}}
+      Cors__AllowedOrigins__1: ${WEB_ORIGIN_DEV:-http://localhost:5174}
+      MINEOS_TELEMETRY_ENABLED: ${MINEOS_TELEMETRY_ENABLED:-false}
+      MINEOS_TELEMETRY_ENDPOINT: ${MINEOS_TELEMETRY_ENDPOINT:-https://mineos.net}
+      MINEOS_INSTALLATION_ID: ${MINEOS_INSTALLATION_ID:-}
+      MINEOS_TELEMETRY_KEY: ${MINEOS_TELEMETRY_KEY:-}
+      MINEOS_SHUTDOWN_TIMEOUT: ${MINEOS_SHUTDOWN_TIMEOUT:-300}
     volumes:
-      - ${HOST_BASE_DIRECTORY:-/var/games/minecraft}:/var/games/minecraft
+      - ${HOST_BASE_DIRECTORY:-./minecraft}:/var/games/minecraft
       - ${Data__Directory:-./data}:/app/data
-      - /var/run/docker.sock:/var/run/docker.sock  # For Docker management (optional)
+    expose:
+      - "5078"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5078/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     ports:
-      - "${API_PORT:-5078}:5078"
-      # Minecraft server ports - expand as needed
       - "${MC_PORT_RANGE:-25565-25570}:${MC_PORT_RANGE:-25565-25570}/tcp"
       - "${MC_PORT_RANGE:-25565-25570}:${MC_PORT_RANGE:-25565-25570}/udp"
-      # Bedrock server ports (UDP only)
       - "${BEDROCK_PORT_RANGE:-19132-19137}:${BEDROCK_PORT_RANGE:-19132-19137}/udp"
 
-    #healthcheck:
-      #test: ["CMD", "curl", "-f", "http://localhost:5078/health"]
-      #interval: 30s
-      #timeout: 10s
-      #retries: 3
-      #start_period: 40s
-
-  # MineOS Web UI
   web:
-    image: ghcr.io/freeman412/mineos-web:${MINEOS_IMAGE_TAG:-latest}
-    container_name: mineos-web
+    image: mineos-custom-web:discord-v1
+    pull_policy: never
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      args:
+        PUBLIC_BUILD_ID: custom-discord-v1
     restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+process.env.PORT+'/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     environment:
       NODE_ENV: production
-
-      # Server-side (SSR, +server.ts) should call the API via docker DNS
       PRIVATE_API_BASE_URL: http://api:5078
-
-      # Used by your server routes
-      PRIVATE_API_KEY: ${ApiKey__SeedKey}
-
-      # SvelteKit node server bind
+      PRIVATE_API_KEY: ${ApiKey__SeedKey:?Run bash scripts/prepare.sh first}
       HOST: 0.0.0.0
-      PORT: 3000
-
-      # Browser API base - empty uses window.location.origin (recommended)
+      PORT: "3000"
+      ORIGIN: ${ORIGIN:-${WEB_ORIGIN:-http://localhost:${WEB_PORT:-6070}}}
       PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
       PUBLIC_MINECRAFT_HOST: ${PUBLIC_MINECRAFT_HOST:-}
+      BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-512M}
       PUBLIC_MC_PORT_RANGE: ${MC_PORT_RANGE:-25565-25570}
-
-      # SvelteKit CSRF/origin check must match exactly what you type in the browser
-      ORIGIN: ${ORIGIN:-http://localhost:${WEB_PORT:-3000}}
-      # Allow large mod uploads via SvelteKit
-      BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-Infinity}
-
-    depends_on:
-      - api
     ports:
-      - "${WEB_PORT:-3000}:3000"
-
-networks:
-  default:
-    name: mineos-network
+      - "${WEB_BIND_ADDRESS:-0.0.0.0}:${WEB_PORT:-6070}:3000"
