@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
 	import { beforeNavigate } from '$app/navigation';
-	import { newDiscordRule, type DiscordConfiguration, type DiscordJournal, type DiscordPreview, type DiscordRule } from '$lib/discord';
+	import { newDiscordId, newDiscordRule, type DiscordConfiguration, type DiscordJournal, type DiscordPreview, type DiscordRule } from '$lib/discord';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
@@ -53,7 +53,7 @@
 	}
 
 	function addDestination() {
-		configuration.destinations.push({ id: crypto.randomUUID(), name: '', enabled: true, webhookUrl: '', hasWebhook: false });
+		configuration.destinations.push({ id: newDiscordId(), name: '', enabled: true, webhookUrl: '', hasWebhook: false });
 	}
 
 	function removeDestination(id: string) {
@@ -76,7 +76,7 @@
 	}
 
 	function duplicate(rule: DiscordRule) {
-		configuration.rules.push({ ...structuredClone($state.snapshot(rule)), id: crypto.randomUUID(), name: `${rule.name.slice(0, 90)} (copie)` });
+		configuration.rules.push({ ...structuredClone($state.snapshot(rule)), id: newDiscordId(), name: `${rule.name.slice(0, 90)} (copie)` });
 	}
 
 	async function showPreview(rule: DiscordRule) {

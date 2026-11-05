@@ -57,6 +57,16 @@ jobs:
         run: |
           docker compose up -d --no-build --wait --wait-timeout 180
           python3 test/deployment-smoke.py
+      - name: Check Discord browser interactions on localhost and HTTP
+        working-directory: apps/web
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:6070
+          # Disposable CI account from .env.template. No production credentials.
+          MINEOS_E2E_USERNAME: admin
+          MINEOS_E2E_PASSWORD: replace-with-a-unique-password
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test tests/discord.spec.ts --workers=1 --reporter=line
       - name: Stop validation containers
         if: always()
         run: docker compose down

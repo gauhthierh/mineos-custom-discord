@@ -2,6 +2,26 @@
 
 Date : 5 novembre 2026. Base d'origine : branche `vibing`, commit `12bbed1`.
 
+## Correctif du bouton en HTTP (preview.4)
+
+Le défaut a été reproduit dans Chromium avec `isSecureContext === false` :
+`crypto.randomUUID` n'existe pas, le clic lève une exception et le nombre de salons
+reste inchangé. Les premières vérifications sur localhost ne couvraient pas ce cas.
+
+La création des identifiants des salons, des règles et des copies utilise désormais
+`crypto.getRandomValues` lorsque `randomUUID` n'est pas disponible. Le format UUID v4
+et le caractère aléatoire des identifiants sont conservés.
+
+- Tests unitaires : 139 réussis, dont trois tests de compatibilité HTTP.
+- Deux parcours Chromium réussis : localhost et origine HTTP non sécurisée.
+  Ils couvrent l'ajout de deux salons, les règles de statut et de sauvegardes,
+  la création et la duplication d'une règle, l'aperçu, l'enregistrement et le rechargement.
+- L'origine HTTP est explicitement vérifiée non sécurisée, sans `crypto.randomUUID`.
+- Aucun message Discord réel envoyé : notifications en pause et webhooks fictifs.
+- Vérification Svelte/TypeScript : aucune erreur, avertissements hérités inchangés.
+- Construction de l'interface de production réussie.
+- Ces parcours navigateur font désormais partie des contrôles avant publication.
+
 ## Révision avec fichiers standards (preview.3)
 
 - Déploiement normalisé sur `.env`, `docker-compose.yml` et `install.sh`.
