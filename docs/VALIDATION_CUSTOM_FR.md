@@ -2,7 +2,7 @@
 
 Date : 5 novembre 2026. Base d'origine : branche `vibing`, commit `12bbed1`.
 
-## Correctif du bouton en HTTP (preview.4)
+## Correctif du bouton en HTTP (preview.5)
 
 Le défaut a été reproduit dans Chromium avec `isSecureContext === false` :
 `crypto.randomUUID` n'existe pas, le clic lève une exception et le nombre de salons

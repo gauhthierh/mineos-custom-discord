@@ -1,6 +1,6 @@
 # Corriger « Ajouter un salon » en HTTP
 
-Le correctif est inclus dans `custom-discord-2026.11.05-preview.4`.
+Le correctif est inclus dans `custom-discord-2026.11.05-preview.5`.
 En HTTP via une IP ou un nom réseau, le navigateur ne fournit pas `crypto.randomUUID`.
 L'ajout des salons et des règles, ainsi que la duplication, utilisent désormais
 une méthode compatible HTTP qui conserve des identifiants UUID v4 aléatoires.
@@ -20,7 +20,7 @@ Les identifiants, les réglages Discord et les serveurs Minecraft sont conservé
     exit 1
   }
   patch_dir=$(mktemp -d)
-  source_url=https://raw.githubusercontent.com/gauhthierh/mineos-custom-discord/custom-discord-2026.11.05-preview.4
+  source_url=https://raw.githubusercontent.com/gauhthierh/mineos-custom-discord/custom-discord-2026.11.05-preview.5
   curl -fsSL "$source_url/apps/web/src/lib/discord.ts" -o "$patch_dir/discord.ts"
   curl -fsSL "$source_url/apps/web/src/routes/(app)/admin/discord/+page.svelte" -o "$patch_dir/discord.svelte"
   cp -- "$patch_dir/discord.ts" apps/web/src/lib/discord.ts
