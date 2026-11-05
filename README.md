@@ -5,6 +5,18 @@
 > Voir [le guide custom](docs/CUSTOM_DISCORD_FR.md) et [l'installation par lien](docs/INSTALL_LINK_FR.md).
 > Les commandes `mineos.net` ci-dessous installent la version d'origine.
 
+## Installation de notre préversion custom
+
+Dépôt : [gauhthierh/mineos-custom-discord](https://github.com/gauhthierh/mineos-custom-discord).
+Après publication d'une préversion validée, installer sur Debian 13 avec :
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GauhthierH/mineos-custom-discord/vibing/scripts/install-custom.sh | bash -s -- --preview
+```
+
+Le circuit de publication vérifie les tests et le démarrage Linux avant de créer
+la release. Voir [les détails de l'installation](docs/INSTALL_LINK_FR.md).
+
 A simple web interface to create and manage Minecraft servers. Run as many servers as you want, install mods with one click, and manage everything from your browser.
 
 ## Features
