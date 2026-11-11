@@ -44,6 +44,8 @@ class DefaultLayoutTests(unittest.TestCase):
         self.assertEqual(str(web["ports"][0]["published"]), "6070")
         self.assertEqual(web["ports"][0]["host_ip"], "0.0.0.0")
         self.assertEqual(web["environment"]["ORIGIN"], "http://localhost:6070")
+        self.assertEqual(str(web["environment"]["BODY_SIZE_LIMIT"]), "10737418240")
+        self.assertEqual(str(web["environment"]["WEB_REQUEST_TIMEOUT_MS"]), "86400000")
 
     def test_previous_preview_settings_survive_renaming(self):
         config = self.config("Auth__SeedUsername=old-admin\nAuth__SeedPassword=existing-password\n"

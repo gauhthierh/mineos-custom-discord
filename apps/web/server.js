@@ -3,8 +3,12 @@
 
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { handler } from './build/handler.js';
 import { closeSafely } from './wsCloseCode.js';
+import { DEFAULT_BODY_SIZE_LIMIT, uploadRequestTimeout } from './httpUploadPolicy.js';
+
+// The adapter reads this during module initialization. Set it before importing it.
+process.env.BODY_SIZE_LIMIT ??= String(DEFAULT_BODY_SIZE_LIMIT);
+const { handler } = await import('./build/handler.js');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -38,7 +42,11 @@ function shouldProxyWebSocket(path) {
 }
 
 // Create HTTP server
-const server = createServer(handler);
+export const server = createServer({
+	requestTimeout: uploadRequestTimeout(process.env.WEB_REQUEST_TIMEOUT_MS),
+	// Keep the short header timeout; only receiving a large body needs more time.
+	headersTimeout: 60_000
+}, handler);
 
 // Create WebSocket server (no server - we'll handle upgrades manually)
 const wss = new WebSocketServer({ noServer: true });

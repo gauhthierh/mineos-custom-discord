@@ -26,5 +26,6 @@ set -o noclobber
   printf 'WEB_BIND_ADDRESS=0.0.0.0\nWEB_PORT=6070\nORIGIN=http://localhost:6070\n'
   printf 'MC_PORT_RANGE=25565-25570\nBEDROCK_PORT_RANGE=19132-19137\nHost__OwnerUid=1000\nHost__OwnerGid=1000\n'
   printf 'MINEOS_TELEMETRY_ENABLED=false\n'
+  printf 'BODY_SIZE_LIMIT=10737418240\nWEB_REQUEST_TIMEOUT_MS=86400000\n'
 } > .env
 printf '%s\n' '.env créé. Le compte administrateur et son mot de passe sont dans ce fichier.'

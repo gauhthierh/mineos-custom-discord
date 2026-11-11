@@ -111,6 +111,46 @@ chargement, elle apparaît comme un salon et une règle couvrant les événement
 Une fois la nouvelle configuration enregistrée, elle prend le relais ; supprimer
 toutes les règles ne réactive pas l'ancien webhook.
 
+## Importer une archive volumineuse
+
+À partir de `custom-discord-2026.11.11-preview.7`, l'import accepte par défaut
+**10 Gio** (10 737 418 240 octets), soit au moins un fichier de 10 Go.
+Le fichier traverse le serveur web en flux et s'enregistre progressivement sur disque.
+L'archive n'apparaît dans les imports qu'après réception complète. Un envoi annulé
+supprime son fichier temporaire et conserve une archive existante portant le même nom.
+
+Les délais de réception et de réponse aux uploads sont portés à 24 heures,
+avec un délai court conservé pour la réception des en-têtes HTTP.
+Les requêtes d'upload utilisent uniquement la session de l'utilisateur ; l'API
+vérifie son rôle administrateur, sans élévation par la clé technique du serveur web.
+
+Dans `.env`, les paramètres correspondants sont :
+
+```dotenv
+BODY_SIZE_LIMIT=10737418240
+WEB_REQUEST_TIMEOUT_MS=86400000
+```
+
+Si une ancienne valeur `BODY_SIZE_LIMIT=512M` existe, la remplacer. Les autres
+identifiants et réglages restent inchangés. Cette mise à jour nécessite de
+reconstruire **l'API et l'interface** avec la procédure ci-dessous.
+Prévoir l'espace disque de l'archive et de son contenu décompressé.
+
+Si un reverse proxy se trouve devant MineOS, sa propre limite et ses délais doivent
+également autoriser cette taille. Exemple nginx, dans le bloc `location` de MineOS :
+
+```nginx
+client_max_body_size 10g;
+proxy_http_version 1.1;
+proxy_request_buffering off;
+proxy_read_timeout 24h;
+proxy_send_timeout 24h;
+```
+
+Le déploiement direct sur le port 6070 n'utilise pas nginx. Pour les services de
+proxy externes imposant un plafond de taille, utiliser une adresse qui autorise
+les gros fichiers. L'augmentation de la limite MineOS ne change pas celle d'un tiers.
+
 ## Installation neuve sur Debian 13
 
 ```bash
@@ -155,7 +195,7 @@ Prévoir une interruption et arrêter proprement les serveurs Minecraft avant de
 sauvegarder `data/`, `minecraft/` et le fichier de secrets.
 
 Télécharger le paquet `mineos-custom-source.tar.gz` et son `.sha256` depuis la
-[release preview.6](https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.05-preview.6).
+[release preview.7](https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.11-preview.7).
 Vérifier `sha256sum -c mineos-custom-source.tar.gz.sha256` dans le dossier de téléchargement,
 puis extraire le paquet dans le dossier de l'installation existante, sans déplacer
 `data/` ou `minecraft/`. Le paquet ne contient aucun fichier `.env`.
@@ -169,7 +209,7 @@ installation actuelle, après la sauvegarde décrite ci-dessus :
   install_dir="$PWD"
   [[ -f .env || -f .env.custom ]] || { echo 'Place-toi dans le dossier de MineOS.' >&2; exit 1; }
   download_dir=$(mktemp -d)
-  release_url=https://github.com/gauhthierh/mineos-custom-discord/releases/download/custom-discord-2026.11.05-preview.6
+  release_url=https://github.com/gauhthierh/mineos-custom-discord/releases/download/custom-discord-2026.11.11-preview.7
   curl -fsSL "$release_url/mineos-custom-source.tar.gz" -o "$download_dir/mineos-custom-source.tar.gz"
   curl -fsSL "$release_url/mineos-custom-source.tar.gz.sha256" -o "$download_dir/mineos-custom-source.tar.gz.sha256"
   (cd "$download_dir" && sha256sum -c mineos-custom-source.tar.gz.sha256)

@@ -8,6 +8,7 @@
 	import { formatBytes, formatDate } from '$lib/utils/formatting';
 	import { createEventStream, type EventStreamHandle } from '$lib/utils/eventStream';
 	import { createClassificationRefresher } from '$lib/utils/proxy';
+	import { archiveUploadError } from '$lib/utils/archiveUploadError';
 	import CopyButton from '$lib/components/CopyButton.svelte';
 	import ProgressBar from '$lib/components/ProgressBar.svelte';
 	import StatusBadge from '$lib/components/StatusBadge.svelte';
@@ -281,19 +282,11 @@
 					return;
 				}
 
-				let message = 'Upload failed';
-				try {
-					const parsed = JSON.parse(xhr.responseText || '{}');
-					message = parsed.error || message;
-				} catch {
-					if (xhr.responseText) {
-						message = xhr.responseText;
-					}
-				}
-				reject(new Error(message));
+				reject(new Error(archiveUploadError(xhr.status, xhr.responseText)));
 			};
 
-			xhr.onerror = () => reject(new Error('Upload failed'));
+			xhr.onerror = () => reject(new Error(archiveUploadError(0)));
+			xhr.ontimeout = () => reject(new Error(archiveUploadError(408)));
 			xhr.send(file);
 		});
 	}

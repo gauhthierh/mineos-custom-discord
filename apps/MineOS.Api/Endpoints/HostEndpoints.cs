@@ -305,8 +305,12 @@ public static class HostEndpoints
 
             try
             {
-                await importService.SaveImportAsync(filename, request.Body, cancellationToken);
+                await importService.SaveImportAsync(filename, request.Body, cancellationToken, request.ContentLength);
                 return Results.Ok(new { filename });
+            }
+            catch (InvalidDataException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
             }
             catch (ArgumentException ex)
             {

@@ -2,6 +2,32 @@
 
 Date : 5 novembre 2026. Base d'origine : branche `vibing`, commit `12bbed1`.
 
+## Import d'archives de 10 Gio (11 novembre 2026, preview.7)
+
+- Limite par défaut passée de 512 Mio à 10 Gio dans Compose, l'image web et
+  le serveur Node utilisé en dehors de Docker.
+- Délais des gros envois portés à 24 heures ; délai d'en-têtes conservé à une minute.
+- Relais d'upload par flux Node avec backpressure, contrôle de taille au fil de
+  l'eau et authentification JWT de l'utilisateur, sans clé de service privilégiée.
+- Écriture dans un fichier temporaire puis renommage après réception complète ;
+  vérification du Content-Length 64 bits, nettoyage après interruption et
+  conservation de l'archive précédente. Les fichiers temporaires ne sont pas listés.
+- Messages d'erreur lisibles pour dépassement de taille, délai, session et connexion.
+- 354 tests .NET réussis. Vérification Svelte sans erreur et 153 tests web réussis.
+- Trois parcours navigateur réussis : les deux parcours Discord précédents et
+  l'envoi d'un ZIP depuis le sélecteur de fichiers de la page Import Servers,
+  avec confirmation et apparition de l'archive complète dans la liste.
+- Le test dédié génère un ZIP64 valide de taille exacte sans l'allouer en mémoire.
+  Le workflow vérifie 10 Gio via le serveur web de production vers une API de comptage,
+  avec un plafond de mémoire du processus web fixé à 1 Gio.
+- Test local avec l'API .NET réelle et une base jetable : ZIP64 de **10 737 418 240
+  octets** transféré et enregistré, structure ZIP64 du fichier reçu vérifiée.
+  Durée locale mesurée : 29 secondes ; pic du processus web de test : 144 Mio.
+  Ce pic inclut le serveur web et le générateur de données, pas le processus .NET.
+- Un second envoi annulé après le début de l'écriture a conservé l'archive
+  complète et supprimé le fichier temporaire. Le fichier de 10 Gio a ensuite été
+  supprimé du dossier jetable ; aucun serveur Minecraft du propriétaire n'a été utilisé.
+
 ## Pied de page personnalisable (preview.6)
 
 - Nouveau réglage global `footerText`, initialisé à MineOS pour les anciennes

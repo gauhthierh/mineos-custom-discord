@@ -200,6 +200,9 @@ public sealed class HostService : IHostService
         foreach (var file in Directory.EnumerateFiles(importPath))
         {
             cancellationToken.ThrowIfCancellationRequested();
+                var name = Path.GetFileName(file);
+                if (name.StartsWith(".upload-", StringComparison.Ordinal)
+                    && name.EndsWith(".tmp", StringComparison.Ordinal)) continue;
             var info = new FileInfo(file);
             results.Add(new ArchiveEntryDto(info.LastWriteTimeUtc, info.Length, info.Name));
         }

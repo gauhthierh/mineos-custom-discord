@@ -8,7 +8,7 @@
 ## Installation de notre préversion custom
 
 Dépôt : [gauhthierh/mineos-custom-discord](https://github.com/gauhthierh/mineos-custom-discord).
-La [préversion validée](https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.05-preview.6)
+La [préversion validée](https://github.com/gauhthierh/mineos-custom-discord/releases/tag/custom-discord-2026.11.11-preview.7)
 est disponible. Installer sur Debian 13 avec :
 
 ```bash

@@ -53,11 +53,15 @@ jobs:
           npm run build
       - name: Build Linux containers
         run: docker compose build
+      - name: Stream a 10 GiB ZIP64 upload with bounded memory
+        working-directory: apps/web
+        timeout-minutes: 10
+        run: node tests/import-upload-smoke.mjs
       - name: Check Linux startup
         run: |
           docker compose up -d --no-build --wait --wait-timeout 180
           python3 test/deployment-smoke.py
-      - name: Check Discord browser interactions on localhost and HTTP
+      - name: Check Discord and archive import in the browser
         working-directory: apps/web
         env:
           PLAYWRIGHT_BASE_URL: http://127.0.0.1:6070
@@ -66,7 +70,7 @@ jobs:
           MINEOS_E2E_PASSWORD: replace-with-a-unique-password
         run: |
           npx playwright install --with-deps chromium
-          npx playwright test tests/discord.spec.ts --workers=1 --reporter=line
+          npx playwright test tests/discord.spec.ts tests/import-upload.spec.ts --workers=1 --reporter=line
       - name: Stop validation containers
         if: always()
         run: docker compose down

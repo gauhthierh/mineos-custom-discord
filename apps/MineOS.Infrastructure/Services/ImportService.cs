@@ -25,7 +25,7 @@ public sealed class ImportService : IImportService
     private string GetServersPath() =>
         Path.Combine(_options.BaseDirectory, _options.ServersPathSegment);
 
-    public async Task<string> SaveImportAsync(string filename, Stream content, CancellationToken cancellationToken)
+    public async Task<string> SaveImportAsync(string filename, Stream content, CancellationToken cancellationToken, long? expectedLength = null)
     {
         if (string.IsNullOrWhiteSpace(filename))
         {
@@ -49,8 +49,24 @@ public sealed class ImportService : IImportService
         Directory.CreateDirectory(importPath);
 
         var targetPath = Path.Combine(importPath, safeName);
-        await using var target = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.None);
-        await content.CopyToAsync(target, cancellationToken);
+        var temporaryPath = Path.Combine(importPath, $".upload-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            await using (var target = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write,
+                             FileShare.None, 81920, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            {
+                await content.CopyToAsync(target, 81920, cancellationToken);
+                if (expectedLength.HasValue && target.Length != expectedLength.Value)
+                    throw new InvalidDataException("Le transfert est incomplet. Renvoie l'archive.");
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            // Publish only a completed file; an interrupted upload must not replace a valid archive.
+            File.Move(temporaryPath, targetPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+        }
 
         _logger.LogInformation("Uploaded import archive {Filename}", safeName);
         return targetPath;
