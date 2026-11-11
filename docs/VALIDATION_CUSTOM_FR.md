@@ -27,6 +27,15 @@ Date : 5 novembre 2026. Base d'origine : branche `vibing`, commit `12bbed1`.
 - Un second envoi annulé après le début de l'écriture a conservé l'archive
   complète et supprimé le fichier temporaire. Le fichier de 10 Gio a ensuite été
   supprimé du dossier jetable ; aucun serveur Minecraft du propriétaire n'a été utilisé.
+- Validation Linux et publication réussies :
+  https://github.com/gauhthierh/mineos-custom-discord/actions/runs/43027568639
+- Le test Linux de comptage a reçu 10 737 418 240 octets : pic web mesuré
+  de 165 Mio, durée de 13 secondes. Les trois parcours navigateur ont aussi réussi.
+- Release : `custom-discord-2026.11.11-preview.7`, commit `a19201d`.
+- Paquet public téléchargé et vérifié après publication, SHA-256 :
+  `b3e237318cb0e3acc6904aff3161d5805556c0c6b5c13e4c599e9be008f7c2ac`.
+- Les fichiers standards sont conservés. La correction reste à appliquer au
+  Debian du propriétaire ; le test réel décrit ci-dessus vise l'instance locale jetable.
 
 ## Pied de page personnalisable (preview.6)
 
